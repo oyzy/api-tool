@@ -93,6 +93,15 @@ var (
 		gfx.MoveTo(6, 6), gfx.LineTo(18, 18),
 		gfx.MoveTo(18, 6), gfx.LineTo(6, 18),
 	)
+	icoBranch = func() gfx.Icon {
+		cmds := circle(6, 6, 2.4)
+		cmds = append(cmds, circle(6, 18, 2.4)...)
+		cmds = append(cmds, circle(18, 6, 2.4)...)
+		cmds = append(cmds,
+			gfx.MoveTo(6, 8.4), gfx.LineTo(6, 15.6),
+			gfx.MoveTo(6, 10), gfx.CubicTo(10.5, 10, 13, 8.4, 15.6, 8.4))
+		return strokeGlyph(cmds...)
+	}()
 	icoLock = strokeGlyph(append(
 		circle(12, 8, 3),
 		gfx.MoveTo(6, 11), gfx.LineTo(18, 11), gfx.LineTo(18, 21), gfx.LineTo(6, 21), gfx.ClosePath(),

@@ -1658,6 +1658,84 @@ func TestThemePresets(t *testing.T) {
 	}
 }
 
+// TestUpdateCheck covers the version gate: semver comparison, picking the
+// platform's asset out of a release, and a full check against a fake
+// releases/latest endpoint (newer, equal and broken payloads).
+func TestUpdateCheck(t *testing.T) {
+	if !semverLess("v0.1.0", "0.2.0") || !semverLess("0.1.9", "v0.10.0") || semverLess("v0.1.1", "v0.1.1") || semverLess("v0.2.0", "v0.1.9") {
+		t.Fatal("semverLess is wrong")
+	}
+
+	assets := []relAsset{
+		{Name: "apitool-windows-amd64.exe", Size: 15093760, BrowserDownloadURL: "https://example.com/win.exe"},
+		{Name: "apitool-linux-amd64", Size: 15908128, BrowserDownloadURL: "https://example.com/linux"},
+		{Name: "apitool-darwin-arm64", Size: 0, BrowserDownloadURL: "https://example.com/mac"},
+	}
+	a, ok := pickAsset(assets, "windows", "amd64")
+	if !ok || a.Name != "apitool-windows-amd64.exe" {
+		t.Fatalf("windows asset = %+v ok=%v", a, ok)
+	}
+	if a2, ok := pickAsset(assets, "darwin", "arm64"); ok || a2.Name != "" {
+		t.Fatal("the zero-size darwin asset must be rejected")
+	}
+	if _, ok := pickAsset(assets, "linux", "arm64"); ok {
+		t.Fatal("no linux-arm64 asset exists")
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/"+repoSlug+"/releases/latest" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintf(w, `{"tag_name":"v9.9.9","html_url":"https://github.com/oyzy/api-tool/releases/tag/v9.9.9","body":"修复与改进","assets":[{"name":"apitool-windows-amd64.exe","size":123,"browser_download_url":"%s/win.exe"}]}`, srvAssetBase)
+	}))
+	defer srv.Close()
+	srvAssetBase = srv.URL
+
+	old := updateAPIBase
+	updateAPIBase = srv.URL
+	defer func() { updateAPIBase = old }()
+
+	info, err := fetchUpdate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.available || info.version != "v9.9.9" || info.assetName != "apitool-windows-amd64.exe" || info.notes != "修复与改进" {
+		t.Fatalf("update info = %+v", info)
+	}
+	if info.upToDate {
+		t.Fatal("v9.9.9 must not read as up to date for v0.1.0")
+	}
+
+	// the same version reads as up to date
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"tag_name":"v`+appVersion+`"}`)
+	}))
+	defer srv2.Close()
+	updateAPIBase = srv2.URL
+	info, err = fetchUpdate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.available || !info.upToDate {
+		t.Fatalf("same version = %+v, want up to date", info)
+	}
+
+	// a broken endpoint reports the error, not a phantom update
+	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `not json`)
+	}))
+	defer srv3.Close()
+	updateAPIBase = srv3.URL
+	if _, err = fetchUpdate(context.Background()); err == nil {
+		t.Fatal("garbage payload must error")
+	}
+}
+
+// srvAssetBase lets the fake release point its download URL back at the test
+// server.
+var srvAssetBase string
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath) // a fresh store: earlier tests may have persisted sets
 	m := newModel()

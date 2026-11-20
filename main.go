@@ -101,6 +101,16 @@ type model struct {
 	// code menu
 	// (codeOpen moved into tabState: each tab has its own menu)
 
+	// update check
+	updateEff  *ui.EffectState[updateInfo, int]
+	updateSeq  int
+	updateInfo updateInfo
+	updateOpen bool
+	dlEff      *ui.EffectState[dlResult, string]
+	dlInfo     updateInfo
+	dlKey      string
+	dlSeq      int
+
 	// collection runner
 	runEff     *ui.EffectState[httpResult, *outgoing]
 	running    bool
@@ -290,6 +300,12 @@ func newModel() *model {
 	m.runEff = ui.NewEffectKeyed[httpResult, *outgoing](func(ctx context.Context, o *outgoing) (httpResult, error) {
 		return doRequest(ctx, o)
 	}).Sequential()
+	m.updateEff = ui.NewEffectKeyed[updateInfo, int](func(ctx context.Context, _ int) (updateInfo, error) {
+		return fetchUpdate(ctx)
+	})
+	m.dlEff = ui.NewEffectKeyed[dlResult, string](func(ctx context.Context, _ string) (dlResult, error) {
+		return downloadAsset(ctx, m.dlInfo)
+	})
 	if len(m.envSets) == 0 {
 		m.envSets = []envSet{{Name: "默认", Vars: []kv{}}}
 	}
@@ -521,6 +537,39 @@ func (m *model) page(c ui.C) {
 			m.advanceRun(r, err)
 		}
 	}
+	// The update check: seq 0 is the startup check, every 检查更新 click bumps
+	// the key. A startup check stays quiet unless there IS an update; a manual
+	// one always reports.
+	ui.Effect(c, m.updateEff, m.updateSeq)
+	if info, err, ok := m.updateEff.Take(); ok {
+		if err != nil {
+			info.err = err.Error()
+		}
+		m.updateInfo = info
+		if info.available {
+			m.toaster.ShowAction("发现新版本 "+info.version, "点击查看详情", ui.ToastInfo, "查看详情")
+		} else if m.updateSeq > 0 {
+			if info.err != "" {
+				m.toaster.Show("检查更新失败", info.err, ui.ToastError)
+			} else {
+				m.toaster.Show("已是最新版本", "当前 v"+appVersion, ui.ToastSuccess)
+			}
+		}
+	}
+	if _, acted := m.toaster.Acted(); acted {
+		m.updateOpen = true
+	}
+	if m.dlKey != "" {
+		ui.Effect(c, m.dlEff, m.dlKey)
+		if r, err, ok := m.dlEff.Take(); ok {
+			m.dlKey = ""
+			if err != nil {
+				m.toaster.Show("下载失败", err.Error(), ui.ToastError)
+			} else {
+				m.toaster.Show("已下载", r.path+"，关闭当前程序后替换即可完成更新", ui.ToastSuccess)
+			}
+		}
+	}
 	// The app's shortcuts: send, save, new tab, close tab, from anywhere.
 	if ui.Shortcut(c, ui.Primary, "enter") {
 		m.send()
@@ -543,6 +592,15 @@ func (m *model) page(c ui.C) {
 			ui.Spacer(c).Grow(1)
 			ui.Text(c, "ApiTool — API 调试工具").Muted().FontSize(12)
 			ui.Row(c).Grow(1).Justify(ui.End).Items(ui.Center).Children(func() {
+				// The project's home and the update check sit before the theme
+				// menu: titlebar controls take their own clicks despite
+				// MovesWindow.
+				if ui.Button(c, "GitHub").XSmall().Ghost().Icon(icoBranch).Tooltip(repoURL + " — 打开项目主页").Clicked() {
+					c.After(func() { _ = app.OpenURL(repoURL) })
+				}
+				if ui.Button(c, "检查更新").XSmall().Ghost().Tooltip("当前版本 v" + appVersion).Clicked() {
+					c.After(func() { m.updateSeq++ })
+				}
 				themeBtn := ui.Button(c, themePresets[m.themeIdx].name).XSmall().Ghost().Tooltip("切换主题")
 				if themeBtn.Clicked() {
 					m.themeMenuOpen = true
@@ -577,6 +635,84 @@ func (m *model) page(c ui.C) {
 	m.envDialog(c)
 	m.confirmDialog(c)
 	m.importDialog(c)
+	m.updateModal(c)
+}
+
+// plainNotes strips the Markdown a release body is written in down to what a
+// Paragraph can show, and caps its length.
+func plainNotes(notes string, limit int) string {
+	var lines []string
+	for _, line := range strings.Split(notes, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "#")
+		line = strings.ReplaceAll(line, "**", "")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if len(lines) > 0 && lines[len(lines)-1] == "" {
+				continue
+			}
+		}
+		lines = append(lines, line)
+	}
+	out := strings.Join(lines, "\n")
+	if runes := []rune(out); len(runes) > limit {
+		out = string(runes[:limit]) + "…"
+	}
+	return out
+}
+
+// updateModal shows a found release: what changed, and two ways to get it —
+// the release page in a browser, or the asset downloaded into Downloads.
+func (m *model) updateModal(c ui.C) {
+	ui.Modal(c, &m.updateOpen, "发现新版本", func() {
+		info := m.updateInfo
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "当前版本").Muted()
+				ui.Text(c, "v"+appVersion).Mono()
+				ui.Text(c, "→").Muted()
+				ui.Text(c, info.version).Mono().Bold().Color(c.Theme().Primary)
+			})
+			if info.notes != "" {
+				notes := plainNotes(info.notes, 600)
+				ui.Paragraph(c, notes, 6).Muted()
+			}
+			if info.assetName != "" {
+				ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+					ui.Text(c, "安装包").Muted()
+					ui.Text(c, info.assetName).Mono()
+					if info.size > 0 {
+						ui.Text(c, "("+formatSize(int(info.size))+")").Muted().FontSize(12)
+					}
+				})
+			}
+			if m.dlKey != "" {
+				ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+					ui.Spinner(c)
+					ui.Text(c, "下载中…").Muted().FontSize(12)
+				})
+			}
+		})
+	}, func() {
+		info := m.updateInfo
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if info.url != "" {
+				if ui.Button(c, "打开发布页").Outline().Clicked() {
+					c.After(func() { _ = app.OpenURL(info.url) })
+				}
+			}
+			if info.assetURL != "" && m.dlKey == "" {
+				if ui.Button(c, "下载安装包").Clicked() {
+					m.dlSeq++
+					info := m.updateInfo
+					c.After(func() { m.dlInfo, m.dlKey = info, fmt.Sprintf("%s#%d", info.assetURL, m.dlSeq) })
+				}
+			}
+			if ui.Button(c, "关闭").Ghost().Clicked() {
+				m.updateOpen = false
+			}
+		})
+	})
 }
 
 // importDialog pastes a cURL command and parses it into the editor.
