@@ -1,0 +1,11 @@
+# build outputs
+*.exe
+build/
+dist/
+
+# caches and local state
+.gocache/
+data.json
+
+# editor
+*.log

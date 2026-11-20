@@ -1,0 +1,7 @@
+[app]
+name = "apitool"
+id = "dev.example.apitool"
+version = "0.1.0"
+icon = "icon.png"
+executable = "apitool"
+package = "."

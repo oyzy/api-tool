@@ -1,0 +1,208 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+// envSet is one named set of environment variables.
+type envSet struct {
+	Name string
+	Vars []kv
+}
+
+// authConfig is a request's authorization panel: the header it stands for is
+// synthesized at send time (authHeaders), so the user's own header rows stay
+// clean. Type "" is 无 — legacy files load as none.
+type authConfig struct {
+	Type     string // "" | "basic" | "bearer" | "apikey"
+	Username string
+	Password string
+	Token    string
+	Key      string // api key: the header name
+	Value    string // api key: the value
+}
+
+// savedRequest is one saved collection item or one history entry. Group names
+// the folder it sits in; empty is the implicit 未分组.
+type savedRequest struct {
+	Name       string
+	Group      string
+	Time       string
+	Method     string
+	URL        string
+	Params     []kv
+	Headers    []kv
+	BodyType   string
+	Body       string
+	FormFields []formField
+	Auth       authConfig
+	Assertions []assertion
+}
+
+// savedTab is one open request tab, persisted so the workspace survives a
+// restart: the editor's request and which entry it edits. Responses are not
+// kept, and the sync baselines are rebuilt on load.
+type savedTab struct {
+	Method     string
+	URL        string
+	ReqTab     string
+	Params     []kv
+	Headers    []kv
+	BodyType   string
+	Body       string
+	FormFields []formField
+	Auth       authConfig
+	Assertions []assertion
+	Editing    int
+}
+
+// snapshot copies the tab's request into a persisted form.
+func (t *tabState) snapshot() savedTab {
+	return savedTab{
+		Method:     t.method,
+		URL:        t.url,
+		ReqTab:     t.reqTab,
+		Params:     append([]kv(nil), t.params...),
+		Headers:    append([]kv(nil), t.headers...),
+		BodyType:   t.bodyType,
+		Body:       t.body,
+		FormFields: append([]formField(nil), t.formFields...),
+		Auth:       t.auth,
+		Assertions: append([]assertion(nil), t.assertions...),
+		Editing:    t.editing,
+	}
+}
+
+// restore loads a persisted tab: the request fields, the active sub-tab, and
+// baselines that keep the two-way sync from rewriting anything on the first
+// paint. Editing must already be clamped by the caller.
+func (t *tabState) restore(s savedTab) {
+	t.applySaved(savedRequest{
+		Method:     s.Method,
+		URL:        s.URL,
+		Params:     s.Params,
+		Headers:    s.Headers,
+		BodyType:   s.BodyType,
+		Body:       s.Body,
+		FormFields: s.FormFields,
+		Auth:       s.Auth,
+		Assertions: s.Assertions,
+	})
+	t.reqTab = s.ReqTab
+	t.editing = s.Editing
+	t.urlSeen = t.url
+	t.paramsSeen = t.paramsFingerprint()
+	t.bodySeen = ""
+	t.checkBodyJSON() // the chip's ✓/✗ must match the body it came back with
+}
+
+// storeData is everything persisted to disk.
+type storeData struct {
+	Collections []savedRequest `json:"collections"`
+	History     []savedRequest `json:"history"`
+	Groups      []string       `json:"groups"` // folder names, in order; may hold empty folders
+	Envs        []kv           `json:"envs"`   // legacy single set
+	EnvSets     []envSet       `json:"envSets"`
+	ActiveEnv   string         `json:"activeEnv"`
+	Tabs        []savedTab     `json:"tabs"`      // the open request tabs
+	ActiveTab   int            `json:"activeTab"` // which one was on screen
+	Theme       int            `json:"theme"`     // the theme preset's index
+}
+
+// dataPath overrides where the data file lives; empty uses storePath(). It lets
+// tests run against a throwaway file instead of the user's real store.
+var dataPath string
+
+// storeFile returns the data file location, honouring dataPath.
+func storeFile() string {
+	if dataPath != "" {
+		return dataPath
+	}
+	return storePath()
+}
+
+// storePath returns the on-disk location of the data file.
+func storePath() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "apitool", "data.json")
+}
+
+// loadStore reads the data file, returning an empty store when it is missing
+// or unreadable.
+func loadStore() storeData {
+	data := storeData{}
+	b, err := os.ReadFile(storeFile())
+	if err != nil {
+		return data
+	}
+	_ = json.Unmarshal(b, &data)
+	// Migrate a legacy single env list into the multi-env format.
+	if len(data.EnvSets) == 0 && len(data.Envs) > 0 {
+		data.EnvSets = []envSet{{Name: "默认", Vars: data.Envs}}
+		data.ActiveEnv = "默认"
+	}
+	if len(data.EnvSets) == 0 {
+		data.EnvSets = []envSet{{Name: "默认", Vars: []kv{}}}
+	}
+	if data.ActiveEnv == "" {
+		data.ActiveEnv = data.EnvSets[0].Name
+	}
+	// Sanitize the folders: drop empty and duplicate names, keep the order.
+	var groups []string
+	seen := map[string]bool{}
+	for _, g := range data.Groups {
+		if g != "" && !seen[g] {
+			seen[g] = true
+			groups = append(groups, g)
+		}
+	}
+	data.Groups = groups
+	return data
+}
+
+// saveStore writes the data file, creating its directory when needed.
+func saveStore(data storeData) {
+	path := storeFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	b, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, b, 0o644)
+}
+
+// toSaved builds a savedRequest from the tab's request.
+func (t *tabState) toSaved(name string) savedRequest {
+	return savedRequest{
+		Name:       name,
+		Method:     t.method,
+		URL:        t.url,
+		Params:     append([]kv(nil), t.params...),
+		Headers:    append([]kv(nil), t.headers...),
+		BodyType:   t.bodyType,
+		Body:       t.body,
+		FormFields: append([]formField(nil), t.formFields...),
+		Auth:       t.auth,
+		Assertions: append([]assertion(nil), t.assertions...),
+	}
+}
+
+// applySaved loads a saved request into the tab's fields.
+func (t *tabState) applySaved(s savedRequest) {
+	t.method = s.Method
+	t.url = s.URL
+	t.params = append([]kv(nil), s.Params...)
+	t.headers = append([]kv(nil), s.Headers...)
+	t.bodyType = s.BodyType
+	t.body = s.Body
+	t.formFields = append([]formField(nil), s.FormFields...)
+	t.auth = s.Auth
+	t.assertions = append([]assertion(nil), s.Assertions...)
+}

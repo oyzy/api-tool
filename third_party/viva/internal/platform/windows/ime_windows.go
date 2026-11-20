@@ -1,0 +1,996 @@
+package windows
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/vivaui/viva/gfx"
+	inputpkg "github.com/vivaui/viva/internal/input"
+	"github.com/vivaui/viva/internal/platform"
+	"github.com/vivaui/viva/internal/render"
+	"github.com/vivaui/viva/internal/scene"
+	"github.com/vivaui/viva/text"
+)
+
+const (
+	compositionString  = 0x0008
+	compositionAttr    = 0x0010
+	compositionCursor  = 0x0080
+	resultString       = 0x0800
+	compositionPoint   = 2
+	compositionCancel  = 4
+	notifyComposition  = 0x0015
+	textRectangleCount = 4
+	caretTimerID       = 1
+	textCaretWidth     = 2
+)
+
+type compositionForm struct {
+	Style uint32
+	Point point
+	Area  rect
+}
+
+var imm = systemDLL("imm32.dll")
+var getInputContext = imm.NewProc("ImmGetContext")
+var releaseInputContext = imm.NewProc("ImmReleaseContext")
+var getCompositionString = imm.NewProc("ImmGetCompositionStringW")
+var setCompositionWindow = imm.NewProc("ImmSetCompositionWindow")
+var notifyIME = imm.NewProc("ImmNotifyIME")
+var setCandidateWindow = imm.NewProc("ImmSetCandidateWindow")
+var associateContext = imm.NewProc("ImmAssociateContext")
+
+var errSupersededTextFrame = errors.New("windows: text frame superseded during native cancellation")
+
+// candidateForm is CANDIDATEFORM.
+type candidateForm struct {
+	Index, Style uint32
+	Point        point
+	Area         rect
+}
+
+const (
+	candidateExclude = 0x0080 // CFS_EXCLUDE: place the list outside Area
+)
+
+func validateTextInput(input *platform.TextInput) error {
+	if input == nil {
+		return nil
+	}
+	if input.Width <= 0 || input.Height <= 0 || input.FontSize <= 0 {
+		return fmt.Errorf("windows: text input dimensions and font size must be positive")
+	}
+	if input.OnEvent == nil {
+		return fmt.Errorf("windows: text input handler is required")
+	}
+	return validateTextState(input.State)
+}
+
+func validateTextState(state platform.TextState) error {
+	runeCount := utf8.RuneCountInString(state.Value)
+	if !validTextRange(state.Selection, runeCount) {
+		return fmt.Errorf("windows: invalid text selection %+v for %d runes", state.Selection, runeCount)
+	}
+	if state.Composing && !validTextRange(state.Composition, runeCount) {
+		return fmt.Errorf("windows: invalid text composition %+v for %d runes", state.Composition, runeCount)
+	}
+	return nil
+}
+
+func validTextRange(value text.Range, length int) bool {
+	return value.Start >= 0 && value.End >= value.Start && value.End <= length
+}
+
+func (state *windowState) initializeText() error {
+	state.baseRectangleCount = len(state.config.Rectangles)
+	state.baseTextLabelCount = len(state.config.TextLabels)
+	state.textRectangles = append(state.textRectangles[:0], state.config.Rectangles...)
+	state.textLabels = append(state.textLabels[:0], state.config.TextLabels...)
+	if state.config.TextInput == nil && !state.config.DynamicTextInput {
+		return nil
+	}
+	// The caret, the selection and the composition underline stand where the glyphs are
+	// drawn: the shaped line of the text engine is both.
+	engine, err := theTextEngine()
+	if err != nil {
+		return err
+	}
+	state.textEngine = engine
+	if state.config.TextInput == nil {
+		return nil
+	}
+	state.textInput = *state.config.TextInput
+	state.textState = state.textInput.State
+	state.textEnabled = true
+	state.caretVisible = true
+	state.resizeTextStorage(state.baseRectangleCount+textRectangleCount, state.baseTextLabelCount+1)
+	return state.updateTextVisuals()
+}
+
+// endIMEComposition settles the live native composition the way an IME end
+// does: the flags go first, then exactly one Unmark, or a Cancel when the
+// composition was tentative. A later native end finds nothing to settle.
+func (state *windowState) endIMEComposition() {
+	state.imeComposing = false
+	state.imeHasTarget = false
+	event := platform.TextEvent{Kind: platform.TextUnmark}
+	if state.textState.TentativeComposition {
+		event.CompositionPhase = text.CompositionCancel
+	}
+	state.handleTextEvent(event)
+}
+
+func (state *windowState) closeText() {
+	state.imeEpoch++
+	state.textRevision++
+	state.textEnabled = false
+	state.imeComposing, state.imeHasTarget = false, false
+	state.stopCaretTimer()
+	state.textEngine = nil
+}
+
+func (state *windowState) updateTextVisuals() error {
+	if !state.textEnabled {
+		return nil
+	}
+	input := &state.textInput
+	line := state.layoutLine()
+	caretX := state.lineCaret(line, input.FontSize, state.textCaretIndex())
+	textWidth := state.lineWidth(line, input.FontSize)
+	visibleWidth := max(1, input.Width-textCaretWidth)
+	state.textScroll = max(0, min(state.textScroll, caretX, max(0, textWidth-visibleWidth)))
+	if caretX-state.textScroll > visibleWidth {
+		state.textScroll = caretX - visibleWidth
+	}
+	inset := platform.TextAlignmentInset(input.Alignment, input.Width, textWidth, input.Terminal, input.Placed)
+	originX := input.X + inset - state.textScroll
+	label := platform.TextLabel{
+		Value: line.value, X: originX, Y: input.Y,
+		Width:  max(input.Width+state.textScroll, textWidth+textCaretWidth),
+		Height: input.Height, FontSize: input.FontSize, Weight: input.Weight, FontGeneration: input.FontGeneration, Color: input.Color, Layer: input.Layer,
+		Clipped: true, Clip: gfx.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height},
+		// The editor draws over the field, caret and selection: after every shape.
+		ShapesBefore: uint32(len(state.textRectangles)),
+	}
+	if input.Terminal {
+		// A terminal's preedit stands on the terminal's cells, in its fixed-pitch font,
+		// not on the advances of the system UI font.
+		label.Value = state.textDisplayValue()
+		color := gfx.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)}
+		state.textRuns = platform.TerminalPreeditRuns(state.textRuns[:0], label.Value, color)
+		label.Mono, label.MonoFace, label.CellWidth, label.Baseline, label.Runs = true, input.MonoFace, input.CellWidth, input.Baseline, state.textRuns
+	}
+	state.textLabels[state.baseTextLabelCount] = label
+	base := state.baseRectangleCount
+	caretTop, caretHeight := platform.TextCaretBand(input.Y, input.Height, input.FontSize)
+	caretColor := scene.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)}
+	state.textRectangles[base] = render.Rectangle{}
+	state.textRectangles[base+1] = render.Rectangle{}
+	// A terminal is a preedit surface with a cursor of its own. Components that
+	// paint a multi-line caret and selection also ask the native editor to keep
+	// its single-line overlays invisible. In both cases the composition remains
+	// native so the IME continues to own its underline.
+	if !input.Terminal && !input.HideNativeOverlays {
+		selection := state.textState.Selection
+		selectionStart, selectionEnd := state.lineExtent(line, input.FontSize, selection)
+		// Match the centered text line and caret, leaving the field's vertical
+		// padding and border unpainted instead of filling the entire input
+		// (taller fields keep their text on one centered line).
+		state.textRectangles[base] = render.Rectangle{
+			Bounds: scene.Rect{X: originX + selectionStart, Y: caretTop, Width: selectionEnd - selectionStart, Height: caretHeight},
+			Color:  scene.Color{Red: 0.22, Green: 0.48, Blue: 1, Alpha: 0.34},
+			Layer:  input.Layer,
+		}
+		if state.caretVisible {
+			state.textRectangles[base+1] = render.Rectangle{
+				Bounds: scene.Rect{X: platform.TextCaretInsideField(input.Alignment, input.X, input.Width, originX+caretX, textCaretWidth), Y: caretTop, Width: textCaretWidth, Height: caretHeight},
+				Color:  caretColor,
+				Layer:  input.Layer,
+			}
+		}
+	}
+	state.textRectangles[base+2] = render.Rectangle{}
+	state.textRectangles[base+3] = render.Rectangle{}
+	if state.textState.Composing {
+		// Text is vertically centered on LabelBaseline, not on FontSize. Keep
+		// both clause strokes below that baseline, including in taller fields.
+		underlineY := platform.CompositionUnderlineTop(input.Y, input.Height, input.FontSize, state.scale, 3)
+		composition := state.textState.Composition
+		compositionStart, compositionEnd := state.lineExtent(line, input.FontSize, composition)
+		state.textRectangles[base+2] = render.Rectangle{
+			Bounds: scene.Rect{X: originX + compositionStart, Y: underlineY, Width: compositionEnd - compositionStart, Height: 1.5},
+			Color:  caretColor,
+			Layer:  input.Layer,
+		}
+		if state.imeHasTarget {
+			// The clause the input method is converting is underlined more thickly than
+			// the rest of the composition, which is how it tells which part a candidate
+			// list is for.
+			target := text.Range{Start: composition.Start + state.imeTarget.Start, End: composition.Start + state.imeTarget.End}
+			if validTextRange(target, utf8.RuneCountInString(state.textState.Value)) {
+				targetStart, targetEnd := state.lineExtent(line, input.FontSize, target)
+				state.textRectangles[base+3] = render.Rectangle{
+					Bounds: scene.Rect{X: originX + targetStart, Y: underlineY, Width: targetEnd - targetStart, Height: 3},
+					Color:  caretColor,
+					Layer:  input.Layer,
+				}
+			}
+		}
+	}
+	for index := base; index < base+textRectangleCount; index++ {
+		state.textRectangles[index].Clipped = true
+		state.textRectangles[index].Clip = scene.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height}
+	}
+	return nil
+}
+
+func (state *windowState) textDisplayValue() string {
+	if state.textInput.Secure {
+		count := utf8.RuneCountInString(state.textState.Value)
+		if len(state.textMask) != count*len("•") {
+			state.textMask = strings.Repeat("•", count)
+		}
+		return state.textMask
+	}
+	return state.textState.Value
+}
+
+func (state *windowState) textCaretIndex() int {
+	if state.textState.SelectionReversed {
+		return state.textState.Selection.Start
+	}
+	return state.textState.Selection.End
+}
+
+// textLine is the part of an input's display value that the platform lays out: one
+// line. The engine shapes a line, and a multi-line field's value is a whole document,
+// which DirectWrite would lay out as thousands of lines (and the engine refuses past a
+// limit) only for the caret, the selection and the input-method window of a field that
+// paints its own rows. Whatever those need lies on the line the caret is on, so that is
+// the line; a value without a line break is one line, whole.
+type textLine struct {
+	value string // the line, without its break
+	first int    // the rune index of its first rune in the display value
+	runes int    // how many runes it has
+}
+
+// layoutLine is the line of the display value that the caret is on.
+func (state *windowState) layoutLine() textLine {
+	value := state.textDisplayValue()
+	start, end, first := platform.TextLine(value, state.textCaretIndex())
+	return textLine{value: value[start:end], first: first, runes: utf8.RuneCountInString(value[start:end])}
+}
+
+// byteAt is the byte offset in the line of a rune index of the display value, at the
+// nearest end of the line for an index off it.
+func (line textLine) byteAt(runeIndex int) int {
+	runeIndex -= line.first
+	if runeIndex <= 0 {
+		return 0
+	}
+	if runeIndex >= line.runes {
+		return len(line.value)
+	}
+	offset := 0
+	for ; runeIndex > 0; runeIndex-- {
+		_, size := utf8.DecodeRuneInString(line.value[offset:])
+		offset += size
+	}
+	return offset
+}
+
+// lineWidth is the width of the line.
+func (state *windowState) lineWidth(line textLine, size float32) float32 {
+	if state.textInput.Terminal {
+		return state.lineCaret(line, size, utf8.RuneCountInString(state.textDisplayValue()))
+	}
+	return state.textEngine.Width(line.value, size, state.textInput.Weight)
+}
+
+// lineCaret is the x of the caret before the rune index of the display value, from the
+// left of the line. A terminal's preedit is a single line on the terminal's cells.
+func (state *windowState) lineCaret(line textLine, size float32, runeIndex int) float32 {
+	if state.textInput.Terminal {
+		return float32(platform.TerminalPreeditColumn(state.textDisplayValue(), runeIndex)) * state.textInput.CellWidth
+	}
+	return state.textEngine.Caret(line.value, size, state.textInput.Weight, line.byteAt(runeIndex))
+}
+
+// textCaret is lineCaret for the line the caret is on.
+func (state *windowState) textCaret(size float32, runeIndex int) float32 {
+	return state.lineCaret(state.layoutLine(), size, runeIndex)
+}
+
+// lineExtent is the left and right x of the glyphs of the runes in the range, the part
+// of it on the line: the one rectangle a selection or a composition underline is drawn
+// as. A range with text of both directions is drawn from its leftmost to its rightmost
+// glyph.
+func (state *windowState) lineExtent(line textLine, size float32, runes text.Range) (left, right float32) {
+	if state.textInput.Terminal {
+		return state.lineCaret(line, size, runes.Start), state.lineCaret(line, size, runes.End)
+	}
+	state.textSpans = state.textEngine.Selection(state.textSpans[:0], line.value, size, state.textInput.Weight, line.byteAt(runes.Start), line.byteAt(runes.End))
+	if len(state.textSpans) == 0 {
+		return 0, 0
+	}
+	left, right = state.textSpans[0].X, state.textSpans[0].X+state.textSpans[0].Width
+	for _, span := range state.textSpans[1:] {
+		left, right = min(left, span.X), max(right, span.X+span.Width)
+	}
+	return left, right
+}
+
+func (state *windowState) textPointerEvent(event platform.PointerEvent) (platform.TextEvent, bool, error) {
+	if !state.textEnabled || state.textInput.Terminal || state.textInput.Placed || state.imeComposing {
+		state.textDragging = false
+		return platform.TextEvent{}, false, nil
+	}
+	input := &state.textInput
+	switch event.Kind {
+	case platform.PointerDown:
+		state.textDragging = false
+		if event.Button != gfx.PointerButtonPrimary || event.X < input.X || event.X > input.X+input.Width || event.Y < input.Y || event.Y > input.Y+input.Height {
+			return platform.TextEvent{}, false, nil
+		}
+	case platform.PointerMove:
+		if !state.textDragging {
+			return platform.TextEvent{}, false, nil
+		}
+	case platform.PointerUp:
+		state.textDragging = false
+		return platform.TextEvent{}, false, nil
+	case platform.PointerExit:
+		state.textDragging = false
+		return platform.TextEvent{}, false, nil
+	default:
+		return platform.TextEvent{}, false, nil
+	}
+	line := state.layoutLine()
+	inset := platform.TextAlignmentInset(input.Alignment, input.Width, state.lineWidth(line, input.FontSize), input.Terminal, input.Placed)
+	offset := state.textEngine.OffsetAt(line.value, input.FontSize, input.Weight, event.X-input.X-inset+state.textScroll)
+	index := line.first + utf8.RuneCountInString(line.value[:max(0, min(offset, len(line.value)))])
+	if event.Kind == platform.PointerDown {
+		state.textDragAnchor = index
+		state.textDragging = true
+		if event.Modifiers&inputpkg.ModifierShift != 0 {
+			state.textDragAnchor = state.textState.Selection.Start
+			if state.textState.SelectionReversed {
+				state.textDragAnchor = state.textState.Selection.End
+			}
+		} else if event.ClickCount >= 2 {
+			selection := text.WordRange(state.textState.Value, index)
+			if event.ClickCount >= 3 || state.textInput.Secure {
+				selection = text.Range{End: utf8.RuneCountInString(state.textState.Value)}
+			}
+			state.textDragAnchor = selection.Start
+			return platform.TextEvent{Kind: platform.TextSetSelection, Selection: selection}, true, nil
+		}
+	}
+	selection := text.Range{Start: state.textDragAnchor, End: index}
+	return platform.TextEvent{Kind: platform.TextSetSelection, Selection: selection}, true, nil
+}
+
+func (state *windowState) handleTextEvent(event platform.TextEvent) {
+	state.imeEpoch++
+	frame, changed, err := state.textEventFrame(event)
+	if err != nil {
+		state.fail(err)
+		return
+	}
+	if !changed || state.window == 0 {
+		return
+	}
+	state.frameWithText(frame, nil, true)
+}
+
+func (state *windowState) textEventFrame(event platform.TextEvent) (platform.Frame, bool, error) {
+	return state.textEventFrameWithCancel(event, state.cancelNativeComposition)
+}
+
+func (state *windowState) textEventFrameWithCancel(event platform.TextEvent, cancelNative func()) (platform.Frame, bool, error) {
+	if !state.textEnabled || state.textInput.OnEvent == nil {
+		return platform.Frame{}, false, nil
+	}
+	previous := state.textState
+	revision := state.textRevision
+	next, err := state.textInput.OnEvent(event)
+	if err == nil && state.textRevision != revision {
+		return platform.Frame{}, state.window != 0, nil
+	}
+	if err == nil {
+		err = validateTextState(next)
+	}
+	if err != nil {
+		return platform.Frame{}, false, err
+	}
+	redraw := platform.TextInputPresentationChanged(state.textInput.Terminal, previous, next)
+	next = next.WithoutRedraw() // a one-shot request, not editor state
+	ownerChanged := next.CompositionIdentity != previous.CompositionIdentity || next.TentativeComposition != previous.TentativeComposition
+	cancelPrevious := ownerChanged && (state.imeComposing || previous.Composing)
+	if ownerChanged {
+		state.imeEpoch++
+		state.imeComposing, state.imeHasTarget = false, false
+	}
+	state.textRevision++
+	state.textState = next
+	state.textInput.State = next
+	if cancelPrevious {
+		// IMM may reenter the window procedure. Install the new owner first and
+		// never overwrite a newer acknowledgment after cancelling the old one.
+		revision = state.textRevision
+		state.cancelIMEWith(cancelNative)
+		if state.textRevision != revision {
+			return platform.Frame{}, state.window != 0, nil
+		}
+	}
+	if !redraw {
+		return platform.Frame{}, false, nil
+	}
+	state.caretVisible = true
+	if err := state.restartCaretTimer(); err != nil {
+		return platform.Frame{}, false, err
+	}
+	revision = state.textRevision
+	if state.config.OnRedraw != nil {
+		frame, err := state.config.OnRedraw()
+		if err == nil && state.textRevision != revision {
+			// A nested no-op may have acknowledged state without submitting a
+			// frame. Refresh the latest native mirror, without replaying old input.
+			return platform.Frame{}, state.window != 0, nil
+		}
+		return frame, true, err
+	}
+	return platform.Frame{}, true, nil
+}
+
+func (state *windowState) resizeTextStorage(rectangleCount, labelCount int) {
+	if rectangleCount < len(state.textRectangles) {
+		clear(state.textRectangles[rectangleCount:])
+	}
+	if cap(state.textRectangles) < rectangleCount {
+		next := make([]render.Rectangle, rectangleCount)
+		copy(next, state.textRectangles)
+		state.textRectangles = next
+	} else {
+		state.textRectangles = state.textRectangles[:rectangleCount]
+	}
+	if labelCount < len(state.textLabels) {
+		clear(state.textLabels[labelCount:])
+	}
+	if cap(state.textLabels) < labelCount {
+		next := make([]platform.TextLabel, labelCount)
+		copy(next, state.textLabels)
+		state.textLabels = next
+	} else {
+		state.textLabels = state.textLabels[:labelCount]
+	}
+}
+
+func (state *windowState) applyTextInputUpdate(update platform.TextInputUpdate) (bool, bool, error) {
+	return state.applyTextInputUpdateWithCancel(update, state.cancelNativeComposition)
+}
+
+func (state *windowState) applyTextInputUpdateWithCancel(update platform.TextInputUpdate, cancelNative func()) (bool, bool, error) {
+	if !update.Changed {
+		return false, false, nil
+	}
+	if !state.config.DynamicTextInput {
+		return false, false, fmt.Errorf("windows: dynamic text input update is disabled")
+	}
+	if err := validateTextInput(update.Input); err != nil {
+		return false, false, err
+	}
+	wasEnabled := state.textEnabled
+	// A placed/multiline editor updates its caret after every preedit. The
+	// text event has already installed the acknowledged state before redraw;
+	// moving that same editor must not send CPS_CANCEL to the input method.
+	replaced := update.Input == nil || state.textInput.Target != update.Input.Target ||
+		state.textInput.Multiline != update.Input.Multiline || state.textInput.Secure != update.Input.Secure ||
+		state.textInput.Terminal != update.Input.Terminal || state.textInput.Placed != update.Input.Placed ||
+		state.textState != update.Input.State.WithoutRedraw()
+	if replaced {
+		state.textRevision++
+	}
+	revision := state.textRevision
+	if wasEnabled && replaced {
+		state.cancelCompositionWith(cancelNative)
+		if state.textRevision != revision {
+			return false, false, nil
+		}
+	}
+	if replaced {
+		state.pendingHighSurrogate = 0
+	}
+	if update.Input == nil {
+		state.textDragging = false
+		state.textScroll = 0
+		state.textEnabled = false
+		state.textInput = platform.TextInput{}
+		state.textState = platform.TextState{}
+		state.caretVisible = false
+		state.stopCaretTimer()
+		state.updateIMEAssociation()
+		return true, wasEnabled, nil
+	}
+	state.textInput = *update.Input
+	state.textState = state.textInput.State
+	state.textEnabled = true
+	state.caretVisible = true
+	state.updateIMEAssociation()
+	if err := state.restartCaretTimer(); err != nil {
+		return false, false, err
+	}
+	state.positionCompositionWindow()
+	return true, !wasEnabled, nil
+}
+
+// updateIMEAssociation follows the focused input in keeping the host's input
+// method on or off the window (platform.TextInput.DisableIME). A disabled
+// method neither composes nor answers its switch hotkeys here: the keys are
+// another machine's, and it runs its own method over there. What
+// ImmAssociateContext returned is kept for the input that brings the method
+// back, the default context the window was created with.
+func (state *windowState) updateIMEAssociation() {
+	disabled := state.textEnabled && state.textInput.DisableIME
+	if disabled == state.imeDisabled {
+		return
+	}
+	if state.window == 0 {
+		// No window to associate yet, as at OpenWindow time: the first update
+		// after one exists acts for the input that is focused then.
+		return
+	}
+	if disabled {
+		state.cancelComposition()
+		if previous, _, _ := associateContext.Call(state.window, 0); previous != 0 {
+			state.imeContext = previous
+		}
+	} else {
+		associateContext.Call(state.window, state.imeContext)
+		state.imeContext = 0
+	}
+	state.imeDisabled = disabled
+}
+
+func (state *windowState) prepareFrame(frame platform.Frame, nativeVisualChanged bool) (platform.Frame, bool, error) {
+	return state.prepareFrameWithCancel(frame, nativeVisualChanged, state.cancelNativeComposition)
+}
+
+func (state *windowState) prepareFrameWithCancel(frame platform.Frame, nativeVisualChanged bool, cancelNative func()) (platform.Frame, bool, error) {
+	if frame.TextInput.Changed {
+		if !state.config.DynamicTextInput {
+			return platform.Frame{}, false, fmt.Errorf("windows: dynamic text input update is disabled")
+		}
+		if err := validateTextInput(frame.TextInput.Input); err != nil {
+			return platform.Frame{}, false, err
+		}
+	}
+	oldBaseRectangles := state.baseRectangleCount
+	oldBaseLabels := state.baseTextLabelCount
+	baseRectangles := state.textRectangles[:oldBaseRectangles]
+	baseLabels := state.textLabels[:oldBaseLabels]
+	partialRectangles := false
+
+	if !frame.Update.Empty() {
+		if frame.Update.First < 0 || frame.Update.Count < 0 || frame.Update.First > len(frame.Rectangles) || frame.Update.Count > len(frame.Rectangles)-frame.Update.First {
+			return platform.Frame{}, false, fmt.Errorf("windows: invalid canvas rectangle update")
+		}
+		if frame.Update.Rebuild {
+			baseRectangles = frame.Rectangles
+		} else if len(frame.Rectangles) > oldBaseRectangles {
+			// The scene appended instances below the native text overlay. The
+			// overlay keeps its own retained storage, so take the new base and
+			// let the structure-changed path below rebuild the merged list.
+			if frame.Update.First > oldBaseRectangles || frame.Update.First+frame.Update.Count != len(frame.Rectangles) {
+				return platform.Frame{}, false, fmt.Errorf("windows: canvas rectangle count grew outside a suffix update")
+			}
+			baseRectangles = frame.Rectangles
+		} else {
+			if len(frame.Rectangles) != oldBaseRectangles {
+				return platform.Frame{}, false, fmt.Errorf("windows: canvas rectangle count shrank without rebuild")
+			}
+			partialRectangles = true
+		}
+	}
+	if frame.TextLabels != nil {
+		baseLabels = frame.TextLabels
+	}
+
+	inputChanged, inputStructureChanged, err := state.applyTextInputUpdateWithCancel(frame.TextInput, cancelNative)
+	if err != nil {
+		return platform.Frame{}, false, err
+	}
+	if frame.TextInput.Changed && !inputChanged {
+		return platform.Frame{}, false, errSupersededTextFrame
+	}
+	if partialRectangles {
+		copy(state.textRectangles[frame.Update.First:frame.Update.First+frame.Update.Count], frame.Rectangles[frame.Update.First:frame.Update.First+frame.Update.Count])
+	}
+	state.baseRectangleCount = len(baseRectangles)
+	state.baseTextLabelCount = len(baseLabels)
+	extraRectangles, extraLabels := 0, 0
+	if state.textEnabled {
+		extraRectangles, extraLabels = textRectangleCount, 1
+	}
+	rectangleStructureChanged := inputStructureChanged || frame.Update.Rebuild || oldBaseRectangles != state.baseRectangleCount
+	labelStructureChanged := inputStructureChanged || oldBaseLabels != state.baseTextLabelCount
+	state.resizeTextStorage(state.baseRectangleCount+extraRectangles, state.baseTextLabelCount+extraLabels)
+	if rectangleStructureChanged {
+		copy(state.textRectangles[:state.baseRectangleCount], baseRectangles)
+	}
+	if frame.TextLabels != nil || labelStructureChanged {
+		copy(state.textLabels[:state.baseTextLabelCount], baseLabels)
+	}
+
+	visualChanged := nativeVisualChanged || inputChanged || rectangleStructureChanged || labelStructureChanged
+	if state.textEnabled && visualChanged {
+		if err := state.updateTextVisuals(); err != nil {
+			return platform.Frame{}, false, err
+		}
+	}
+
+	merged := platform.Frame{Accessibility: frame.Accessibility}
+	if rectangleStructureChanged {
+		merged.Update = render.Update{Count: len(state.textRectangles), Rebuild: true}
+	} else {
+		merged.Update = frame.Update
+		if state.textEnabled && (nativeVisualChanged || inputChanged) {
+			merged.Update = mergeRenderUpdates(merged.Update, render.Update{First: state.baseRectangleCount, Count: textRectangleCount})
+		}
+	}
+	if !merged.Update.Empty() {
+		merged.Rectangles = state.textRectangles
+	}
+	if frame.TextLabels != nil || labelStructureChanged || state.textEnabled && (nativeVisualChanged || inputChanged) {
+		merged.TextLabels = state.textLabels
+	}
+	dirty := !merged.Update.Empty() || merged.TextLabels != nil
+	return merged, dirty, nil
+}
+
+func mergeRenderUpdates(left, right render.Update) render.Update {
+	if left.Empty() {
+		return right
+	}
+	if right.Empty() {
+		return left
+	}
+	if left.Rebuild || right.Rebuild {
+		return render.Update{Count: max(left.First+left.Count, right.First+right.Count), Rebuild: true}
+	}
+	first := min(left.First, right.First)
+	last := max(left.First+left.Count, right.First+right.Count)
+	return render.Update{First: first, Count: last - first}
+}
+
+func (state *windowState) cancelComposition() {
+	state.textRevision++
+	state.cancelCompositionWith(state.cancelNativeComposition)
+}
+
+func (state *windowState) cancelCompositionWith(cancelNative func()) {
+	state.imeEpoch++
+	if !state.imeComposing && !state.textState.Composing {
+		return
+	}
+	state.imeComposing = false
+	state.imeHasTarget = false
+	state.textState.Composing = false
+	state.textState.Composition = text.Range{}
+	state.cancelIMEWith(cancelNative)
+}
+
+func (state *windowState) cancelIMEWith(cancelNative func()) {
+	// A cancelling context may synchronously emit preedit/end for its retired
+	// owner. Ordinary characters and newer input updates still belong to the app.
+	previous := state.imeCancelling
+	state.imeCancelling = true
+	defer func() { state.imeCancelling = previous }()
+	cancelNative()
+}
+
+func (state *windowState) cancelNativeComposition() {
+	window := state.window
+	if window == 0 {
+		return
+	}
+	context, _, _ := getInputContext.Call(window)
+	if context == 0 {
+		return
+	}
+	notifyIME.Call(context, notifyComposition, compositionCancel, 0)
+	releaseInputContext.Call(window, context)
+}
+
+// caretBlinks reports whether a native caret belongs on screen. Terminal and
+// self-painting input surfaces own both their cursor and selection.
+func (state *windowState) caretBlinks() bool {
+	return state.textEnabled && state.focused && !state.textInput.Terminal && !state.textInput.HideNativeOverlays
+}
+
+func (state *windowState) restartCaretTimer() error {
+	state.stopCaretTimer()
+	if !state.caretBlinks() || state.window == 0 {
+		return nil
+	}
+	interval, _, _ := getCaretBlinkTime.Call()
+	if interval == 0 || uint32(interval) == ^uint32(0) {
+		return nil
+	}
+	timer, _, callErr := setTimer.Call(state.window, caretTimerID, interval, 0)
+	if timer == 0 {
+		return windowsCallError("start caret timer", callErr)
+	}
+	state.caretTimer = timer
+	return nil
+}
+
+func (state *windowState) stopCaretTimer() {
+	if state.caretTimer == 0 {
+		return
+	}
+	if state.window != 0 {
+		killTimer.Call(state.window, state.caretTimer)
+	}
+	state.caretTimer = 0
+}
+
+func (state *windowState) handleCaretTimer(timer uintptr) {
+	if timer != state.caretTimer || !state.textEnabled {
+		return
+	}
+	state.setCaretVisible(!state.caretVisible)
+}
+
+func (state *windowState) setCaretVisible(visible bool) {
+	if !state.textEnabled || state.caretVisible == visible {
+		return
+	}
+	state.caretVisible = visible
+	if err := state.updateTextVisuals(); err != nil {
+		state.fail(err)
+		return
+	}
+	if err := state.renderer.apply(platform.Frame{
+		Update:     render.Update{First: state.baseRectangleCount + 1, Count: 1},
+		Rectangles: state.textRectangles,
+	}); err != nil {
+		state.fail(err)
+		return
+	}
+	invalidateRect.Call(state.window, 0, 0)
+}
+
+type imeCompositionMessage struct {
+	result, preedit       string
+	hasResult, hasPreedit bool
+	selection, target     text.Range
+	hasTarget             bool
+}
+
+type compositionStringReader func(...uintptr) (uintptr, uintptr, error)
+
+func (state *windowState) handleComposition(flags uintptr) {
+	// An input method that has no context to give, or a composition string it
+	// cannot report, loses that one composition. Closing the window over it would
+	// end the whole session for a password typed through a third-party IME.
+	context, _, _ := getInputContext.Call(state.window)
+	if context == 0 {
+		return
+	}
+	defer releaseInputContext.Call(state.window, context)
+	state.handleCompositionData(context, flags, getCompositionString.Call)
+}
+
+func (state *windowState) handleCompositionData(context, flags uintptr, read compositionStringReader) {
+	state.imeEpoch++
+	epoch := state.imeEpoch
+	message := imeCompositionMessage{}
+	if flags&resultString != 0 {
+		value, err := compositionText(context, resultString, read)
+		if err != nil {
+			if state.imeEpoch == epoch && !state.textState.TentativeComposition {
+				state.imeComposing, state.imeHasTarget = false, false
+			}
+			return
+		}
+		message.result, message.hasResult = value, true
+	}
+	// Read the entire native message before an application callback can replace
+	// the input or reset its IMM context while processing the result.
+	if flags&compositionString != 0 {
+		value, err := compositionText(context, compositionString, read)
+		if err == nil {
+			message.preedit, message.hasPreedit = value, true
+			message.target, message.hasTarget = compositionTarget(context, value, read)
+			cursorUnits := 0
+			if flags&compositionCursor != 0 {
+				position, _, _ := read(context, compositionCursor, 0, 0)
+				cursorUnits = max(0, int(int32(position)))
+			}
+			cursorRunes := text.NewEditor(value).UTF16ToRuneIndex(cursorUnits)
+			message.selection = text.Range{Start: cursorRunes, End: cursorRunes}
+		}
+	}
+	if state.imeEpoch == epoch {
+		state.applyIMEComposition(message)
+	}
+}
+
+func (state *windowState) applyIMEComposition(message imeCompositionMessage) {
+	if !state.textEnabled || state.err != nil || state.imeCancelling {
+		return
+	}
+	state.imeEpoch++
+	tentative := state.textState.TentativeComposition
+	owner := state.textState.CompositionIdentity
+	if message.hasResult {
+		state.imeComposing, state.imeHasTarget = false, false
+		event := platform.TextEvent{Kind: platform.TextInsert, Text: message.result}
+		if tentative {
+			event.CompositionPhase = text.CompositionResult
+		}
+		epoch := state.imeEpoch + 1 // the acknowledged Result advances it once
+		state.handleTextEvent(event)
+		if state.imeEpoch != epoch || state.err != nil || !state.textEnabled || state.textInput.DisableIME ||
+			state.textState.CompositionIdentity != owner || state.textState.TentativeComposition != tentative {
+			return
+		}
+	}
+	if message.hasPreedit {
+		state.imeComposing = true
+		state.imeTarget, state.imeHasTarget = message.target, message.hasTarget
+		event := platform.TextEvent{
+			Kind: platform.TextSetMarked, Text: message.preedit,
+			MarkedSelection: message.selection,
+		}
+		if tentative {
+			event.CompositionPhase = text.CompositionUpdate
+		}
+		state.handleTextEvent(event)
+	}
+}
+
+func (state *windowState) positionCompositionWindow() {
+	if !state.textEnabled || state.window == 0 {
+		return
+	}
+	input := &state.textInput
+	context, _, _ := getInputContext.Call(state.window)
+	if context == 0 {
+		return
+	}
+	defer releaseInputContext.Call(state.window, context)
+	// The composition and its candidate list go under the caret, where the text is
+	// being typed; the list keeps off the line itself.
+	caretX, caretY, caretHeight := state.caretCell()
+	scale := state.scale
+	line := rect{Left: int32(caretX * scale), Top: int32(caretY * scale), Right: int32((caretX + 1) * scale), Bottom: int32((caretY + caretHeight) * scale)}
+	form := compositionForm{Style: compositionPoint, Point: point{X: line.Left, Y: line.Bottom}}
+	setCompositionWindow.Call(context, uintptr(unsafe.Pointer(&form)))
+	if setCandidateWindow.Find() == nil {
+		candidates := candidateForm{Style: candidateExclude, Point: form.Point, Area: line}
+		if !input.Placed {
+			candidates.Area.Left, candidates.Area.Right = int32(input.X*scale), int32((input.X+input.Width)*scale)
+		}
+		setCandidateWindow.Call(context, uintptr(unsafe.Pointer(&candidates)))
+	}
+}
+
+// caretCell is where the caret is in logical window pixels: its x, the top of
+// its line and the height of the line.
+func (state *windowState) caretCell() (x, y, height float32) {
+	input := &state.textInput
+	if input.Placed && input.CaretHeight > 0 {
+		// The field laid its rows out itself: this is where it painted its caret.
+		return input.CaretX, input.CaretY, input.CaretHeight
+	}
+	return state.alignedCaretX(state.textCaretIndex()), input.Y, input.Height
+}
+
+func (state *windowState) alignedCaretX(index int) float32 {
+	input := &state.textInput
+	line := state.layoutLine()
+	inset := platform.TextAlignmentInset(input.Alignment, input.Width, state.lineWidth(line, input.FontSize), input.Terminal, input.Placed)
+	caret := input.X + inset + state.textCaret(input.FontSize, index) - state.textScroll
+	return platform.TextCaretInsideField(input.Alignment, input.X, input.Width, caret, textCaretWidth)
+}
+
+// compositionTarget is the clause the input method is converting, as runes of the
+// composition string.
+func compositionTarget(context uintptr, value string, read compositionStringReader) (text.Range, bool) {
+	length, _, _ := read(context, compositionAttr, 0, 0)
+	if int32(length) <= 0 || length > 1<<16 {
+		return text.Range{}, false
+	}
+	attrs := make([]byte, length)
+	written, _, _ := read(context, compositionAttr, uintptr(unsafe.Pointer(&attrs[0])), length)
+	if int32(written) <= 0 || written > length {
+		return text.Range{}, false
+	}
+	return platform.CompositionTarget(attrs[:written], value)
+}
+
+func compositionText(context uintptr, index uintptr, read compositionStringReader) (string, error) {
+	lengthValue, _, _ := read(context, index, 0, 0)
+	length := int(int32(lengthValue))
+	if length < 0 {
+		return "", fmt.Errorf("windows: read IME composition length %d", length)
+	}
+	if length == 0 {
+		return "", nil
+	}
+	if length > 1<<20 || length%2 != 0 {
+		return "", fmt.Errorf("windows: invalid IME composition length %d", length)
+	}
+	values := make([]uint16, length/2)
+	writtenValue, _, _ := read(context, index, uintptr(unsafe.Pointer(&values[0])), uintptr(length))
+	written := int(int32(writtenValue))
+	if written < 0 || written > length || written%2 != 0 {
+		return "", fmt.Errorf("windows: invalid IME composition result %d", written)
+	}
+	return string(utf16.Decode(values[:written/2])), nil
+}
+
+func (state *windowState) handleUTF16Character(value uint16) {
+	state.imeEpoch++
+	textValue, pending, ready := decodeUTF16Character(state.pendingHighSurrogate, value)
+	state.pendingHighSurrogate = pending
+	if !ready {
+		return
+	}
+	state.handleTextEvent(platform.TextEvent{Kind: platform.TextInsert, Text: textValue})
+}
+
+func decodeUTF16Character(pending, value uint16) (string, uint16, bool) {
+	if value < 0x20 || value == 0x7f {
+		return "", pending, false
+	}
+	if value >= 0xd800 && value <= 0xdbff {
+		return "", value, false
+	}
+	if value >= 0xdc00 && value <= 0xdfff && pending != 0 {
+		return string(utf16.DecodeRune(rune(pending), rune(value))), 0, true
+	}
+	return string(rune(value)), 0, true
+}
+
+func (state *windowState) textCommand(key uintptr) (platform.TextCommand, bool) {
+	return state.textCommandWith(key, modifiers()&1 != 0)
+}
+
+// textCommandWith is textCommand for a known state of the Shift key.
+func (state *windowState) textCommandWith(key uintptr, shift bool) (platform.TextCommand, bool) {
+	switch key {
+	case 8:
+		return platform.TextDeleteBackward, true
+	case 9:
+		return 0, false
+	case 13:
+		if !state.textInput.Multiline {
+			return 0, false
+		}
+		if shift {
+			return platform.TextInsertLineBreak, true
+		}
+		return platform.TextInsertNewline, true
+	case 37:
+		if shift {
+			return platform.TextMoveLeftAndModifySelection, true
+		}
+		return platform.TextMoveLeft, true
+	case 39:
+		if shift {
+			return platform.TextMoveRightAndModifySelection, true
+		}
+		return platform.TextMoveRight, true
+	case 46:
+		return platform.TextDeleteForward, true
+	default:
+		return 0, false
+	}
+}

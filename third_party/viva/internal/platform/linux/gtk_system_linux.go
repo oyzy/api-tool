@@ -1,0 +1,465 @@
+//go:build linux && vivagtk
+
+package linux
+
+import (
+	"fmt"
+	"net/url"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/ebitengine/purego"
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/internal/platform"
+)
+
+// The desktop services that go through the display server, on GTK: the clipboard, the primary
+// selection and the cursor. GTK has to be called from the thread that runs its loop, so a call from
+// another goroutine is posted to it and waited for.
+
+// gtkClipboards are the entry points of the clipboard, bound with the first use.
+type gtkClipboards struct {
+	atomIntern func(name *byte, onlyIfExists int32) uintptr
+	get        func(selection uintptr) uintptr
+	waitText   func(clipboard uintptr) uintptr
+	setText    func(clipboard uintptr, text *byte, length int32)
+	hasImage   func(clipboard uintptr) int32
+	waitImage  func(clipboard uintptr) uintptr
+	setImage   func(clipboard, pixbuf uintptr)
+	clear      func(clipboard uintptr)
+	saveBuffer func(pixbuf uintptr, buffer *uintptr, size *uint64, kind *byte, keys, values uintptr, err *uintptr) int32
+	waitURIs   func(clipboard uintptr) uintptr
+	setURIs    func(clipboard, uris uintptr)
+	strfreev   func(list uintptr)
+	// The rich pair: set_with_data owns the clipboard until another copy and
+	// answers the requested target from the get callback.
+	setWithData   func(clipboard, targets uintptr, count int32, get, clear, data uintptr) int32
+	selectionData func(data uintptr) uintptr
+	selectionSet  func(data, kind uintptr, format int32, bytes *byte, length int32) int32
+	selectionGet  func(data uintptr) uintptr
+
+	clipboard, primary uintptr
+	ok                 bool
+}
+
+var clipboards gtkClipboards
+
+func (a *gtkApplication) clipboardAPI() (*gtkClipboards, error) {
+	if clipboards.ok {
+		return &clipboards, nil
+	}
+	g := a.g
+	c := &clipboards
+	for _, name := range []struct {
+		function any
+		symbol   string
+	}{
+		{&c.atomIntern, "gdk_atom_intern"}, {&c.get, "gtk_clipboard_get"}, {&c.waitText, "gtk_clipboard_wait_for_text"},
+		{&c.setText, "gtk_clipboard_set_text"}, {&c.hasImage, "gtk_clipboard_wait_is_image_available"},
+		{&c.waitImage, "gtk_clipboard_wait_for_image"}, {&c.setImage, "gtk_clipboard_set_image"}, {&c.clear, "gtk_clipboard_clear"},
+	} {
+		if !g.lookup(name.function, name.symbol) {
+			return nil, fmt.Errorf("linux: the installed GTK lacks %s", name.symbol)
+		}
+	}
+	selection := func(name string) uintptr {
+		text := cString(name)
+		return c.get(c.atomIntern(&text[0], 0))
+	}
+	c.clipboard, c.primary = selection("CLIPBOARD"), selection("PRIMARY")
+	// Copied files are optional too: an older GTK without them still has the rest.
+	if !g.lookup(&c.waitURIs, "gtk_clipboard_wait_for_uris") || !g.lookup(&c.strfreev, "g_strfreev") {
+		c.waitURIs, c.strfreev = nil, nil
+	}
+	if !g.lookup(&c.setURIs, "gtk_clipboard_set_uris") {
+		c.setURIs = nil
+	}
+	// Images need gdk-pixbuf, which GTK links but this program has not opened. Without it text
+	// still works.
+	if library, err := purego.Dlopen("libgdk_pixbuf-2.0.so.0", purego.RTLD_NOW|purego.RTLD_GLOBAL); err == nil {
+		g.libraries = append(g.libraries, library)
+		if !g.lookup(&c.saveBuffer, "gdk_pixbuf_save_to_bufferv") {
+			c.saveBuffer = nil
+		}
+	}
+	// The rich pair is optional as the file list is: an older GTK without
+	// gtk_clipboard_set_with_data still has plain text.
+	if !g.lookup(&c.setWithData, "gtk_clipboard_set_with_data") ||
+		!g.lookup(&c.selectionData, "gtk_selection_data_get_data") ||
+		!g.lookup(&c.selectionSet, "gtk_selection_data_set") ||
+		!g.lookup(&c.selectionGet, "gtk_selection_data_get_target") {
+		c.setWithData, c.selectionData, c.selectionSet, c.selectionGet = nil, nil, nil, nil
+	}
+	c.ok = true
+	return c, nil
+}
+
+// onMain runs function on the loop's thread and waits for it. On that thread it just runs.
+func (a *gtkApplication) onMain(function func()) error {
+	if a.mainThread == syscall.Gettid() {
+		function()
+		return nil
+	}
+	done := make(chan struct{})
+	a.enqueue(func() {
+		function()
+		close(done)
+	})
+	select {
+	case <-done:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("linux: the window thread did not answer")
+	}
+}
+
+// installHooks makes the desktop services the shell's.
+func (a *gtkApplication) installHooks() {
+	hooks := &desktopHooks{
+		clipboardText: func() (value string, err error) {
+			err = a.onMain(func() { value, err = a.readText(false) })
+			return
+		},
+		setClipboardText: func(value string) (err error) {
+			if e := a.onMain(func() { err = a.writeText(false, value) }); e != nil {
+				return e
+			}
+			return
+		},
+		setClipboardHTML: func(html, alt string) (err error) {
+			if e := a.onMain(func() { err = a.writeHTML(html, alt) }); e != nil {
+				return e
+			}
+			return
+		},
+		primaryText: func() (value string, err error) {
+			err = a.onMain(func() { value, err = a.readText(true) })
+			return
+		},
+		setPrimaryText: func(value string) (err error) {
+			if e := a.onMain(func() { err = a.writeText(true, value) }); e != nil {
+				return e
+			}
+			return
+		},
+		hasClipboardImage: func() (has bool) {
+			_ = a.onMain(func() { has = a.imageAvailable() })
+			return
+		},
+		clipboardImagePNG: func() (png []byte, err error) {
+			if e := a.onMain(func() { png, err = a.readImage() }); e != nil {
+				return nil, e
+			}
+			return
+		},
+		clipboardFiles: func() (paths []string, err error) {
+			if e := a.onMain(func() { paths, err = a.readFiles() }); e != nil {
+				return nil, e
+			}
+			return
+		},
+		setClipboardFiles: func(paths []string) (err error) {
+			if e := a.onMain(func() { err = a.writeFiles(paths) }); e != nil {
+				return e
+			}
+			return
+		},
+		setCursorShape: func(shape uint8) (err error) {
+			if e := a.onMain(func() { err = a.setCursor(shape) }); e != nil {
+				return e
+			}
+			return
+		},
+		setCursorImage: func(image *gfx.CursorImage) (err error) {
+			if e := a.onMain(func() { err = a.setCursorImage(image) }); e != nil {
+				return e
+			}
+			return
+		},
+	}
+	shellHooks.Store(hooks)
+}
+
+func (a *gtkApplication) removeHooks() { shellHooks.Store(nil) }
+
+func (a *gtkApplication) readText(primary bool) (string, error) {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return "", err
+	}
+	board := c.clipboard
+	if primary {
+		board = c.primary
+	}
+	text := c.waitText(board)
+	if text == 0 {
+		return "", nil
+	}
+	defer a.g.gFree(text)
+	return goString(text), nil
+}
+
+func (a *gtkApplication) writeText(primary bool, value string) error {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return err
+	}
+	board := c.clipboard
+	if primary {
+		board = c.primary
+	}
+	if value == "" {
+		c.clear(board)
+		return nil
+	}
+	data := cString(value)
+	c.setText(board, &data[0], int32(len(data)-1))
+	return nil
+}
+
+// gtkTargetEntry is C's GtkTargetEntry: the target's name, its flags and the
+// info the get callback matches on, laid out for the call that takes an array.
+type gtkTargetEntry struct {
+	target uintptr
+	flags  uint32
+	info   uint32
+}
+
+// writeHTML makes the clipboard hold html as text/html beside alt as plain
+// text. GTK owns the pair through gtk_clipboard_set_with_data, whose get
+// callback answers whichever target the requestor asked for; the flavour lives
+// as long as the clipboard does, as it does on X11.
+func (a *gtkApplication) writeHTML(html, alt string) error {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return err
+	}
+	if c.setWithData == nil {
+		return ErrUnsupported
+	}
+	htmlName := cString("text/html")
+	textName := cString("UTF8_STRING")
+	targets := [2]gtkTargetEntry{
+		{target: uintptr(unsafe.Pointer(&htmlName[0]))},
+		{target: uintptr(unsafe.Pointer(&textName[0]))},
+	}
+	htmlAtom := c.atomIntern(&htmlName[0], 0)
+	htmlBytes, textBytes := cString(html), cString(alt)
+	// The get callback runs on GTK's thread with the pair this closure captured,
+	// answering the target the requestor asked for by the atom of its name.
+	get := purego.NewCallback(func(clipboard, selection, data uintptr) uintptr {
+		kind := c.selectionGet(data)
+		value := textBytes
+		if kind == htmlAtom {
+			value = htmlBytes
+		}
+		c.selectionSet(data, kind, 8, &value[0], int32(len(value)))
+		return 0
+	})
+	clearCallback := purego.NewCallback(func(clipboard, userData uintptr) uintptr { return 0 })
+	if c.setWithData(c.clipboard, uintptr(unsafe.Pointer(&targets[0])), 2, get, clearCallback, 0) == 0 {
+		return fmt.Errorf("linux: gtk_clipboard_set_with_data failed")
+	}
+	// gtk_clipboard_set_with_data reads the entries in the call; the get callback
+	// keeps the two flavours for as long as GTK may ask for them.
+	runtime.KeepAlive(htmlName)
+	runtime.KeepAlive(textName)
+	runtime.KeepAlive(htmlBytes)
+	runtime.KeepAlive(textBytes)
+	return nil
+}
+
+// readFiles returns the paths of the file URIs the clipboard holds. GTK asks the owner for
+// text/uri-list and hands over a NULL-terminated array of strings.
+func (a *gtkApplication) readFiles() ([]string, error) {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return nil, err
+	}
+	if c.waitURIs == nil {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	list := c.waitURIs(c.clipboard)
+	if list == 0 {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	defer c.strfreev(list)
+	var text strings.Builder
+	for offset := uintptr(0); ; offset += unsafe.Sizeof(uintptr(0)) {
+		item := *(*uintptr)(unsafePointer(list + offset))
+		if item == 0 || text.Len() > maxClipboardFileListBytes {
+			break
+		}
+		text.WriteString(goString(item))
+		text.WriteByte('\n')
+	}
+	paths := platform.FilesFromURIList([]byte(text.String()))
+	if len(paths) == 0 {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	return paths, nil
+}
+
+// writeFiles makes the clipboard hold paths as URIs. GTK serves the list for
+// as long as it owns the clipboard; the call copies the strings.
+func (a *gtkApplication) writeFiles(paths []string) error {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return err
+	}
+	if c.setURIs == nil {
+		return ErrUnsupported
+	}
+	encoded := make([][]byte, len(paths))
+	pointers := make([]uintptr, len(paths)+1)
+	for index, path := range paths {
+		encoded[index] = cString((&url.URL{Scheme: "file", Path: path}).String())
+		pointers[index] = uintptr(unsafe.Pointer(&encoded[index][0]))
+	}
+	c.setURIs(c.clipboard, uintptr(unsafe.Pointer(&pointers[0])))
+	runtime.KeepAlive(encoded)
+	return nil
+}
+
+func (a *gtkApplication) imageAvailable() bool {
+	c, err := a.clipboardAPI()
+	return err == nil && c.hasImage(c.clipboard) != 0
+}
+
+// readImage returns the clipboard's image as PNG. GTK hands over a pixbuf, whatever form the owner
+// offered, and it is encoded again.
+func (a *gtkApplication) readImage() ([]byte, error) {
+	c, err := a.clipboardAPI()
+	if err != nil {
+		return nil, err
+	}
+	if c.saveBuffer == nil {
+		return nil, platform.ErrNoClipboardImage
+	}
+	if c.hasImage(c.clipboard) == 0 {
+		return nil, platform.ErrNoClipboardImage
+	}
+	pixbuf := c.waitImage(c.clipboard)
+	if pixbuf == 0 {
+		return nil, platform.ErrNoClipboardImage
+	}
+	defer a.g.objectUnref(pixbuf)
+	var buffer uintptr
+	var size uint64
+	var failure uintptr
+	kind := cString("png")
+	if c.saveBuffer(pixbuf, &buffer, &size, &kind[0], 0, 0, &failure) == 0 || buffer == 0 {
+		return nil, fmt.Errorf("linux: encode the clipboard image failed")
+	}
+	defer a.g.gFree(buffer)
+	if size > platform.MaxClipboardImageBytes {
+		return nil, platform.ErrClipboardImageTooLarge
+	}
+	return append([]byte(nil), unsafe.Slice((*byte)(unsafePointer(buffer)), size)...), nil
+}
+
+// cursorNames are in GDK's cursor-name terms the theme names of the cursors (cursor_linux.go).
+func (a *gtkApplication) setCursor(shape uint8) error {
+	if shape != cursorHidden && int(shape) >= len(cursorNames) {
+		return fmt.Errorf("linux: invalid cursor %d", shape)
+	}
+	window := a.active
+	if window == nil || window.closed {
+		return fmt.Errorf("linux: cursor requires a running window")
+	}
+	window.setCursor(shape)
+	return nil
+}
+
+// gdkCursorName is the name GDK looks a cursor up by: the theme name of a shape, and "none", the
+// blank cursor GDK defines, for the hidden one.
+func gdkCursorName(shape uint8) string {
+	if shape == cursorHidden {
+		return "none"
+	}
+	return cursorNames[shape]
+}
+
+func (w *gtkWindow) setCursor(shape uint8) {
+	if w.cursorShape == shape+1 {
+		return
+	}
+	w.cursorShape = shape + 1
+	w.cursorImage = nil
+	g := w.g
+	if w.cursors[shape] == 0 {
+		name := cString(gdkCursorName(shape))
+		w.cursors[shape] = g.gdkCursorFromName(g.gdkDisplayDefault(), &name[0])
+	}
+	w.showCursor(w.cursors[shape])
+	if w.wl != nil {
+		w.wl.setCursor(shape)
+	}
+}
+
+// showCursor makes cursor the pointer over every piece of the window.
+func (w *gtkWindow) showCursor(cursor uintptr) {
+	g := w.g
+	if window := g.widgetGetWindow(w.area); window != 0 {
+		g.gdkWindowSetCursor(window, cursor)
+	}
+	for _, p := range w.pieces {
+		if p.window != 0 {
+			g.gdkWindowSetCursor(p.window, cursor)
+		}
+	}
+	for _, p := range w.inputPieces {
+		if window := g.widgetGetWindow(p.widget); window != 0 {
+			g.gdkWindowSetCursor(window, cursor)
+		}
+	}
+}
+
+// cairoARGB32 is CAIRO_FORMAT_ARGB32: premultiplied, a 32-bit word a pixel.
+const cairoARGB32 = 0
+
+// setCursorImage makes the picture the pointer through GDK, sized in widget units from the
+// picture's own scale. The compositor-drawn Wayland subsurface has a pointer of its own that GDK
+// does not reach, so there the picture is refused and the pointer keeps its shape.
+func (w *gtkWindow) setCursorImage(image *gfx.CursorImage) error {
+	if w.wl != nil {
+		return unsupported("an application cursor is not available on the Wayland subsurface")
+	}
+	if w.cursorImage == image && w.imageCursor != 0 {
+		return nil
+	}
+	g := w.g
+	if g.gdkCursorFromSurface == nil || g.cairoSurfaceForData == nil {
+		return unsupported("this GTK has no cursor from a surface")
+	}
+	width, height, hotX, hotY, pixels := platform.CursorPixels(image, image.Scale(), true)
+	perUnit := float64(image.Scale()) / float64(w.ratio)
+	surface := g.cairoSurfaceForData(&pixels[0], cairoARGB32, int32(width), int32(height), int32(width*4))
+	if surface == 0 {
+		return fmt.Errorf("linux: make the cursor surface")
+	}
+	g.cairoDeviceScale(surface, perUnit, perUnit)
+	cursor := g.gdkCursorFromSurface(g.gdkDisplayDefault(), surface, float64(hotX)/perUnit, float64(hotY)/perUnit)
+	g.cairoSurfaceDestroy(surface)
+	if cursor == 0 {
+		return fmt.Errorf("linux: make the cursor from its surface")
+	}
+	w.showCursor(cursor)
+	if w.imageCursor != 0 {
+		g.objectUnref(w.imageCursor)
+	}
+	w.imageCursor, w.cursorImage, w.imagePixels = cursor, image, pixels
+	w.cursorShape = 0 // the next shape is applied, whichever it is
+	return nil
+}
+
+func (a *gtkApplication) setCursorImage(image *gfx.CursorImage) error {
+	window := a.active
+	if window == nil || window.closed {
+		return fmt.Errorf("linux: cursor requires a running window")
+	}
+	return window.setCursorImage(image)
+}

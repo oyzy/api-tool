@@ -1,0 +1,400 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml runs this same gate before it publishes a release.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A pull request keeps only its newest run: an older push to the same branch has
+# nothing left to prove. A commit on main is never cancelled, so every commit a
+# release is cut from has run this whole gate to the end; the group is keyed on
+# the commit there, which lets consecutive pushes overlap instead of dropping
+# one.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # A change that only touches documentation runs no gate at all. This job always
+  # runs, though: the check a branch protection rule requires is "ci passed"
+  # below, and a required check that a path filter skipped would stay pending
+  # forever and hold the pull request shut.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: decide whether this change needs the gate
+        id: paths
+        run: |
+          # A release tag always runs the whole gate: the tag is what ships, so
+          # nothing about its contents may skip a check.
+          case "${{ github.ref }}" in
+            refs/tags/*) echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -n "$base" ] || base="${{ github.event.before }}"
+          code=true
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git diff --name-only --no-renames "$base" HEAD > "$RUNNER_TEMP/changed"
+            code=false
+            while IFS= read -r file; do
+              case "$file" in
+                # Nothing here can change what the gate builds, runs or measures.
+                # website/ is not documentation: tools/docs generates pages from
+                # Go sources, and website.yml is what builds the site.
+                *.md | docs/* | LICENSE | NOTICE | .github/ISSUE_TEMPLATE/*) ;;
+                *) code=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed"
+          else
+            echo "no base commit to compare with; running the gate" >&2
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "### changed files"
+            head -50 "$RUNNER_TEMP/changed" 2>/dev/null | sed 's/^/    /' || true
+            echo "code=$code"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Formatting and the Linux type-check of every package. Both are the same on
+  # every operating system, so they belong on the cheapest runner there is
+  # rather than on a macOS one.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      # The darwin type-check is the darwin job's; cross-vet covers the other
+      # targets this repository ships for.
+      - name: vet
+        run: go vet ./...
+      # The page-facing packages keep reflection and untyped containers out of
+      # their exported API; the layout, input, scene and render paths depend on
+      # it, and a symbol that needs one usually needs a typed one instead.
+      - name: API discipline
+        run: go run ./tools/apicheck ./ui ./components ./app ./gfx
+
+  # Every target Viva ships for must at least type-check, tests included. The
+  # targets do not depend on each other, so they run at the same time on one
+  # runner: asking for four runners to do what one can finish in the same minute
+  # only spends more queue time.
+  cross-vet:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: vet every target
+        run: |
+          status=0
+          pids=""
+          # linux/amd64 is the lint job's `go vet ./...`, over every package.
+          for target in linux/arm64 windows/amd64 windows/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} \
+              go vet ./internal/... ./app/ ./cmd/... ./components/... ./update/... &
+            pids="$pids $!"
+          done
+          for pid in $pids; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
+      - name: GTK optional capability contracts
+        run: |
+          go vet -tags vivagtk ./app ./internal/platform/linux
+          go test -tags vivagtk ./internal/platform/linux -run '^TestGTK(WaylandAlwaysOnTopReportsUnsupported|ClipboardFileWriteReportsUnsupportedWithoutASetter)$' -count=1
+      # The Linux package is not part of the sharded run (it drives X11), so the
+      # titlebar contracts that do not need a server name their tests here.
+      - name: Titlebar and window contracts
+        run: go test ./internal/platform/linux -run '^TestMaximizeButtonSetsBothDirections$' -count=1 -v
+      - name: Native X11 global shortcut
+        env:
+          VIVA_NATIVE_GLOBAL_SHORTCUT_TEST: '1'
+        run: |
+          sudo apt-get install -y xvfb xdotool libx11-xcb1 ||
+            { sudo apt-get update && sudo apt-get install -y xvfb xdotool libx11-xcb1; }
+          xvfb-run -a go test ./internal/platform/linux -run '^TestNativeX11GlobalShortcut$' -count=1 -v
+
+  # The browser target is a release target: it compiles every package, runs the
+  # shared tests under GOOS=js, and builds the browser entry points and a guide.
+  # The browser gate below is separate so installing Playwright's system
+  # dependencies does not extend this job's critical path.
+  web:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up Go with the WASM GC fix (golang/go#80499)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: true
+      - name: vet the browser target
+        run: GOOS=js GOARCH=wasm go vet ./...
+      - name: test under the Go wasm runtime
+        run: |
+          # cmd/viva is the host build tool; its tests invoke a host Go toolchain
+          # and package installers, not the browser runtime.
+          # A package with no files for js/wasm (the native window backends,
+          # host-only tools) cannot be tested on this target; go list prints a
+          # blank line for it, which is dropped here.
+          packages=$(GOOS=js GOARCH=wasm CGO_ENABLED=0 \
+            go list -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... |
+            sed '/^$/d' | grep -v '^github.com/vivaui/viva/cmd/viva$')
+          # shellcheck disable=SC2086 # one package per word, by design
+          GOOS=js GOARCH=wasm go test $packages \
+            -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1
+      - name: build browser entry points
+        run: |
+          GOOS=js GOARCH=wasm go build \
+            ./cmd/component-preview ./cmd/gallery-web \
+            ./examples/guides/hello ./examples/guides/webview
+
+  # The real browser gate. It builds the fixture and drives it through the
+  # three engines in parallel with the wasm tests above; most of its elapsed
+  # time is Playwright's GTK/GStreamer dependency install, which has no place
+  # on the wasm job's critical path.
+  web-browser:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/webcheck/package-lock.json
+      - name: build the browser verification fixture
+        run: go run ./cmd/viva build --target web ./tools/webcheck/fixture -o build/webcheck
+      - name: install the browser gate
+        run: |
+          npm ci --prefix tools/webcheck
+          tools/webcheck/node_modules/.bin/playwright install --with-deps chromium firefox webkit
+      # Each engine gets its own step so a failure names the engine that broke
+      # and the others still report their own result.
+      - name: drive the browser verification page (chromium)
+        run: node tools/webcheck/check.mjs --dir build/webcheck --browser chromium
+      - name: drive the browser verification page (firefox)
+        run: node tools/webcheck/check.mjs --dir build/webcheck --browser firefox
+      - name: drive the browser verification page (webkit)
+        run: node tools/webcheck/check.mjs --dir build/webcheck --browser webkit
+
+  # The whole test suite except the packages that carry darwin-only files, split
+  # over several runners. .github/scripts/test-packages.sh decides what this
+  # shard owns: a package with no darwin file behaves identically on every
+  # operating system, so it runs here once instead of on macOS as well.
+  test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: this shard's packages
+        run: |
+          .github/scripts/test-packages.sh linux "${{ matrix.shard }}" 3 > "$RUNNER_TEMP/packages"
+          sed 's/^/    /' "$RUNNER_TEMP/packages"
+      # NSIS is what makes the Windows installer tests build a real installer
+      # instead of skipping it: install it only in the shard that has them.
+      - name: NSIS
+        run: |
+          if grep -qE '/(cmd/viva|tools/winpkg)$' "$RUNNER_TEMP/packages"; then
+            # The runner's package lists are normally usable as they are, and
+            # refreshing them is the slow half of an install.
+            sudo apt-get install -y nsis ||
+              { sudo apt-get update && sudo apt-get install -y nsis; }
+          fi
+      - name: test
+        run: |
+          # shellcheck disable=SC2046 # one package per word, by design
+          go test $(cat "$RUNNER_TEMP/packages") -count=1
+
+  # The one job that has to be on macOS: cgo reaches Cocoa there, and the
+  # packages that carry a darwin-only file can be tested nowhere else. Everything
+  # else is in the test job above.
+  darwin:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # A package with no darwin file compiles to the same source on every
+      # operating system, so the lint job's `go vet ./...` already covers it;
+      # what is left here is the darwin build of the packages that have one. The
+      # tests of that set are bound by hdiutil, codesign and the linker rather
+      # than by the cores, so the two type-checks run beside them, not before.
+      - name: vet and test
+        run: |
+          status=0
+          # shellcheck disable=SC2046 # one package per word, by design
+          go vet $(.github/scripts/test-packages.sh darwin) & vet=$!
+          go vet -tags vivahead ./internal/platform/darwin ./headless/... & headless=$!
+          # shellcheck disable=SC2046 # one package per word, by design
+          go test $(.github/scripts/test-packages.sh darwin) -count=1 & tests=$!
+          for job in "$vet" "$headless" "$tests"; do
+            wait "$job" || status=1
+          done
+          exit "$status"
+
+      - name: Native Carbon global shortcut
+        env:
+          VIVA_NATIVE_GLOBAL_SHORTCUT_TEST: '1'
+        run: go test ./internal/platform/darwin -run '^TestNativeCarbonGlobalShortcut$' -count=1 -v
+
+  windows-materials:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    env:
+      VIVA_SOFTWARE_RENDERING: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # WARP is a Windows API: this cannot run anywhere else. The file icon and
+      # native structure ABI tests are here for the same reason: they build only
+      # on Windows.
+      - name: Material contracts and controls (WARP)
+        run: go test ./internal/platform/windows ./ui ./components ./headless ./app -run 'Test(Backdrop|WindowBackdrop|Notification|TaskbarCreated|CompositionClear|CompositionFallback|CompositionCreation|CustomBackdrop|AcrylicAccent|LegacyAcrylic|RoundedOutline|Translucent|MonospaceFamilies|FontWeights|(The)?MonoWeights|(The)?InterfaceWeights|EveryListedFamilyResolves|EngineReportsTheFontsUnderline|AlwaysOnTop|SaveDialogCheckbox|FileIcon|NativeStructureABI)' -count=1 -v
+      - name: Terminal keyboard routing
+        run: go test ./internal/platform/windows -run '^TestATerminalGetsEditingKeysAndChordsAsRawKeys$' -count=1 -v
+      - name: Native Windows global shortcut
+        env:
+          VIVA_NATIVE_GLOBAL_SHORTCUT_TEST: '1'
+        run: go test ./internal/platform/windows -run '^TestNativeGlobalShortcutRegistration$' -count=1 -v
+      - name: Native Direct2D text origins
+        run: go test ./internal/platform/windows -run '^TestDirectTextLayoutOriginByValue$' -count=1 -v
+      # The installer contracts, including WinVerifyTrust's struct layout, only
+      # compile and run on Windows.
+      - name: Update installer contracts
+        run: go test ./update -count=1 -v
+      # A paint that arrives while a window is minimized is a Windows-only
+      # window management case, and the swap chain it would otherwise resize is
+      # what the taskbar previews.
+      - name: Minimized windows keep their visible frame
+        run: go test ./internal/platform/windows -run '^TestMinimizedPaintKeepsTheVisibleSwapChain$' -count=1 -v
+
+  # Cross-vet does not exercise the Windows ARM64 calling convention.
+  windows-arm64-text:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          architecture: arm64
+          cache: true
+      - name: Native ARM64 Direct2D text origins
+        run: |
+          if ((go env GOARCH) -ne 'arm64') { throw 'Expected native ARM64 Go' }
+          go test ./internal/platform/windows -run '^TestDirectTextLayoutOriginByValue$' -count=1 -v
+
+  # A noise-tolerant benchmark regression gate for the pure-Go paths: the base
+  # revision and the pull request run the same benchmarks on the same runner,
+  # and a slowdown above benchmarks/history.sh's threshold (15% and at least
+  # 20 ns) or any new allocation fails. Platform, GPU and window benchmarks are
+  # deliberately out: they are not reproducible on a shared runner.
+  benchmarks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: checkout the base revision
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          git worktree add --detach ../base FETCH_HEAD
+      - name: benchmark base
+        run: VIVA_ROOT=../base ./benchmarks/ci.sh /tmp/base.txt
+      - name: benchmark candidate
+        run: ./benchmarks/ci.sh /tmp/head.txt
+      - name: compare
+        run: go run ./tools/perfhistory compare -threshold 0.20 -min-ns 100 /tmp/base.txt < /tmp/head.txt
+
+  # The single check to require in branch protection. It reports success when
+  # every job this change needed passed and the rest were skipped, so a
+  # documentation-only pull request is green without running anything and a
+  # change that skipped a job by path filter can never sit pending forever.
+  passed:
+    name: ci passed
+    if: always()
+    needs: [changes, lint, cross-vet, web, web-browser, test, darwin, windows-materials, windows-arm64-text, benchmarks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every job this change needed passed
+        run: |
+          for result in ${{ join(needs.*.result, ' ') }}; do
+            case "$result" in
+              success | skipped) ;;
+              *)
+                echo "a job ended $result: ${{ join(needs.*.result, ' ') }}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+  # Release sizes on every change, without blocking: hello is over its own
+  # alarm limit while the ui/components boundary decision (see
+  # docs/benchmarks/2026-11-12-size-attribution-darwin-arm64.md) is open, so
+  # the job records the number on each run and the hard limit returns with
+  # the boundary. Builds the same targets benchmarks/size.sh checks on a
+  # release machine; remove continue-on-error when the limit is honest again.
+  size:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: release sizes
+        run: ./benchmarks/size.sh

@@ -1,0 +1,29 @@
+/build/
+/dist/
+/packages/
+*.dxvk-cache
+/website/node_modules/
+/website/.astro/
+/tools/webcheck/node_modules/
+
+# State left by `wrangler pages dev` when checking the deploy output locally.
+/.wrangler/
+
+# Local agent instructions and machine-specific settings, not part of the project.
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.agents/
+
+# Addresses and passwords of your own test machines, kept out of the repository.
+/tools/testenv/local.*
+
+# Local research notes, not part of the published tree.
+/private/
+
+# Binaries built inside the tool modules by `go build`.
+/tools/complexgen/complexgen
+/tools/ffi-cost/ffi-cost
+
+# A signing key written by viva update-keygen in the project root.
+/update.key

@@ -1,0 +1,27 @@
+package componentdemo
+
+var groupBComponents = []Component{
+	commandComponent,
+	contextMenuComponent,
+	drawerComponent,
+	dropdownMenuComponent,
+	emptyComponent,
+	fieldComponent,
+	formComponent,
+	hoverCardComponent,
+	iconHoverComponent,
+	inputGroupComponent,
+	inputOTPComponent,
+	itemComponent,
+	kbdComponent,
+	labelComponent,
+	listComponent,
+	markdownComponent,
+	markerComponent,
+	menubarComponent,
+	messageComponent,
+	messageScrollerComponent,
+	metricCardComponent,
+	multiSelectComponent,
+	nativeSelectComponent,
+}

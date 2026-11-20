@@ -1,0 +1,247 @@
+package components
+
+import "github.com/vivaui/viva/gfx"
+
+// Checkbox paints one official shadcn checkable control. State remains owned
+// by the caller and is exposed through a stable typed hit.
+type Checkbox struct {
+	canvas    *gfx.Canvas
+	theme     gfx.Theme
+	id        gfx.ID
+	bounds    gfx.Rect
+	hitBounds gfx.Rect
+	label     string
+	checked   bool
+	// indeterminate is Base UI's mixed state: the box shows a dash and the
+	// accessibility value is "mixed", whatever checked says.
+	indeterminate bool
+	focused       bool
+	invalid       bool
+	disabled      bool
+	// recipe, when set, replaces CheckboxRecipe; see Button.Recipe.
+	recipe func(gfx.Theme, gfx.State) CheckboxLook
+}
+
+// BeginCheckbox starts a checkbox declaration. Bounds provide only the visual
+// origin; the official visual remains 16px at default density. ID zero is
+// preview-only.
+func BeginCheckbox(canvas *gfx.Canvas, theme gfx.Theme, id gfx.ID, bounds gfx.Rect, checked bool) Checkbox {
+	focused := false
+	if canvas != nil && !id.IsZero() {
+		focused = canvas.FocusVisible() == id
+	}
+	return Checkbox{
+		canvas: canvas, theme: theme, id: id, bounds: bounds,
+		label: "checkbox", checked: checked, focused: focused,
+	}
+}
+
+// Recipe replaces the theme's checkbox recipe for this checkbox. A nil recipe
+// keeps the theme's.
+func (checkbox Checkbox) Recipe(recipe func(gfx.Theme, gfx.State) CheckboxLook) Checkbox {
+	checkbox.recipe = recipe
+	return checkbox
+}
+
+// Label sets the accessible name without changing visual geometry.
+func (checkbox Checkbox) Label(label string) Checkbox {
+	checkbox.label = label
+	return checkbox
+}
+
+// HitBounds makes an enclosing label or selection card activate this checkbox.
+// The visual square keeps its normal position and size; zero bounds use the
+// default enlarged target. The entire target exposes one checkbox semantic hit,
+// so it replaces the square's target rather than adding to it: the rect must
+// contain the square, and it must not cover other interactive hits painted
+// after this checkbox, because the later hit wins. Canvas.HitLabel is the other
+// way to make an enclosing region activate a control; it keeps the control's
+// own bounds and exposes the region as that control's label, so prefer it when
+// the semantic target should stay the square.
+func (checkbox Checkbox) HitBounds(bounds gfx.Rect) Checkbox {
+	checkbox.hitBounds = bounds
+	return checkbox
+}
+
+// Indeterminate paints Base UI's mixed state: a primary box with a dash,
+// exposed as aria-checked="mixed". It takes precedence over Checked.
+func (checkbox Checkbox) Indeterminate() Checkbox {
+	checkbox.indeterminate = true
+	return checkbox
+}
+
+// Invalid applies the official destructive validation border and ring.
+func (checkbox Checkbox) Invalid() Checkbox {
+	checkbox.invalid = true
+	return checkbox
+}
+
+// Disabled paints the official 50% opacity state and retains disabled
+// accessibility semantics for nonzero IDs.
+func (checkbox Checkbox) Disabled() Checkbox {
+	checkbox.disabled = true
+	return checkbox
+}
+
+// CheckboxResult is what painting reports back; Clicked is true in the event pass of a
+// click on the control (see gfx.Canvas.Clicked), so the code that declares it
+// handles it.
+type CheckboxResult struct {
+	canvas *gfx.Canvas
+	id     gfx.ID
+}
+
+// Clicked reports whether this paint is delivering a click on the control.
+func (result CheckboxResult) Clicked() bool {
+	return result.canvas != nil && result.canvas.Clicked(result.id)
+}
+
+// CheckboxExtent is the side of a checkbox's square at the theme's density.
+func CheckboxExtent(theme gfx.Theme) float32 { return 16 * theme.Metrics.ControlHeight / 32 }
+
+// CheckboxHitExtent is the width and height of the interaction region Paint
+// declares around a checkbox at the theme's density. A layout that gives a
+// checkbox this much room can center the square inside it and keep adjacent
+// checkboxes' hit regions from overlapping.
+func CheckboxHitExtent(theme gfx.Theme) (width, height float32) {
+	side := CheckboxExtent(theme)
+	scale := theme.Metrics.ControlHeight / 32
+	return side + 24*scale, side + 16*scale
+}
+
+// Paint draws the checkbox and declares its enlarged desktop hit region.
+func (checkbox Checkbox) Paint() CheckboxResult {
+	result := CheckboxResult{canvas: checkbox.canvas, id: checkbox.id}
+	if checkbox.canvas == nil {
+		return result
+	}
+	scale := checkbox.theme.Metrics.ControlHeight / 32
+	checkbox.bounds.Width = CheckboxExtent(checkbox.theme)
+	checkbox.bounds.Height = checkbox.bounds.Width
+
+	state := gfx.State{
+		Checked: checkbox.checked, Mixed: checkbox.indeterminate, FocusVisible: checkbox.focused,
+		Invalid: checkbox.invalid, Disabled: checkbox.disabled,
+	}
+	look := checkboxRecipe(&checkbox.theme, state)
+	if checkbox.recipe != nil {
+		look = checkbox.recipe(checkbox.theme, state)
+	}
+	checkbox.canvas.Elevate(checkbox.bounds, look.Radius, look.Shadow) // shadow-xs
+	if look.RingWidth > 0 {
+		checkbox.canvas.Rounded(expand(checkbox.bounds, look.RingWidth), look.RingRadius, look.Ring)
+	}
+	paintBordered(checkbox.canvas, checkbox.theme, checkbox.bounds, look.Radius, look.Border, look.Fill)
+	PaintCheckboxMark(checkbox.canvas, checkbox.bounds, state, look.Mark)
+	if !checkbox.id.IsZero() {
+		hitBounds := gfx.Rect{
+			X: checkbox.bounds.X - 12*scale, Y: checkbox.bounds.Y - 8*scale,
+			Width: checkbox.bounds.Width + 24*scale, Height: checkbox.bounds.Height + 16*scale,
+		}
+		if checkbox.hitBounds.Width > 0 && checkbox.hitBounds.Height > 0 {
+			hitBounds = checkbox.hitBounds
+		}
+		checkbox.canvas.HitWithOptions(checkbox.id, hitBounds, checkbox.label, gfx.HitOptions{
+			Role: gfx.RoleCheckbox, Disabled: checkbox.disabled,
+			Checked: checkbox.checked && !checkbox.indeterminate, Mixed: checkbox.indeterminate,
+		})
+	}
+	return result
+}
+
+// The check is a vector, not a character. A ✓ set in a font is whatever the system's
+// fonts hold for it: a different shape, weight and place in the line box on each
+// platform (Segoe UI Symbol's is a tall calligraphic stroke, SF's a short one), and none
+// is the Lucide mark the other icons are drawn with. A path is the same on all of them.
+var checkIcon = gfx.Icon{ViewBox: 24, Stroke: 2, Cap: gfx.CapRound, Join: gfx.JoinRound, Commands: []gfx.PathCommand{
+	// Center the visible path on y=12 too: the original y=6..17 glyph sits
+	// half a view-box unit above the center of its 24-unit canvas.
+	gfx.MoveTo(20, 6.5), gfx.LineTo(9, 17.5), gfx.LineTo(4, 12.5),
+}}
+
+// paintCheck draws a check mark size pixels square, centered in bounds.
+func paintCheck(canvas *gfx.Canvas, bounds gfx.Rect, size float32, color gfx.Color) {
+	canvas.DrawIcon(checkIcon, gfx.Rect{X: bounds.X + (bounds.Width-size)/2, Y: bounds.Y + (bounds.Height-size)/2, Width: size, Height: size}, color)
+}
+
+// CheckboxLook is the look of a checkbox in one state.
+type CheckboxLook struct {
+	// Fill, Border and Mark are the colors of the box, its line and its check or dash.
+	// Over an opaque theme Fill and Border are flattened onto the page background, as
+	// TextEntryLook's are, so the box paints as one solid shape (RoundedBorder).
+	Fill, Border, Mark gfx.Color
+	// Radius is the corner radius of the box.
+	Radius float32
+	// Shadow is the elevation under the box.
+	Shadow gfx.ShadowLevel
+	// Ring is the halo of a focused or invalid box; it is transparent, with a zero
+	// RingWidth, when there is none. RingRadius is its outer corner radius and
+	// RingWidth how far it reaches beyond the box.
+	Ring                  gfx.Color
+	RingWidth, RingRadius float32
+}
+
+// CheckboxRecipe resolves the look of a checkbox. Checked, Mixed, FocusVisible, Invalid and
+// Disabled of state are read; a checked or mixed box takes the primary color whatever else
+// is true of it.
+func CheckboxRecipe(theme gfx.Theme, state gfx.State) CheckboxLook {
+	return checkboxRecipe(&theme, state)
+}
+
+// checkboxRecipe is the recipe for a theme that is not to be copied: the controls paint every frame,
+// and a Theme is large.
+func checkboxRecipe(theme *gfx.Theme, state gfx.State) CheckboxLook {
+	scale := theme.Metrics.ControlHeight / 32
+	on := state.Checked || state.Mixed
+	look := CheckboxLook{
+		Fill: theme.Background, Border: theme.Input, Mark: theme.PrimaryForeground,
+		Radius: 4 * scale, Shadow: gfx.ShadowXS,
+	}
+	look.Fill.Alpha = 0
+	if isDark(theme) {
+		look.Fill = scaledAlpha(theme.Input, 0.30)
+	}
+	if on {
+		look.Fill, look.Border = theme.Primary, theme.Primary
+	}
+	if state.FocusVisible && !on {
+		look.Border = theme.Ring
+	}
+	if state.Invalid && !on {
+		look.Border = invalidBorder(theme)
+	}
+	if state.FocusVisible || state.Invalid {
+		look.Ring = scaledAlpha(theme.Ring, 0.50)
+		if state.Invalid {
+			look.Ring = invalidRing(theme)
+		}
+		look.RingWidth, look.RingRadius = 3*scale, 7*scale
+	}
+	if state.Disabled {
+		look.Fill.Alpha *= 0.50
+		look.Border.Alpha *= 0.50
+		look.Mark.Alpha *= 0.50
+	}
+	if theme.Background.Alpha >= 1 {
+		look.Fill, look.Border = look.Fill.Over(theme.Background), look.Border.Over(theme.Background)
+	}
+	return look
+}
+
+// PaintCheckboxMark draws the mark of a checkbox in bounds, the box: a dash when mixed,
+// a check when checked, nothing otherwise. The check is the vector the shadcn checkbox
+// draws, so a box of the application's own shows the same mark.
+func PaintCheckboxMark(canvas *gfx.Canvas, bounds gfx.Rect, state gfx.State, color gfx.Color) {
+	switch {
+	case state.Mixed:
+		dash := bounds.Width * 0.5
+		thickness := max(bounds.Height/8, 1)
+		canvas.Fill(gfx.Rect{
+			X:     bounds.X + (bounds.Width-dash)/2,
+			Y:     bounds.Y + (bounds.Height-thickness)/2,
+			Width: dash, Height: thickness,
+		}, color)
+	case state.Checked:
+		paintCheck(canvas, bounds, bounds.Height*0.875, color)
+	}
+}

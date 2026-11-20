@@ -1,0 +1,33 @@
+package {{PACKAGE}}
+
+import "github.com/vivaui/viva/gfx"
+
+// MetricCard paints a dashboard metric with a trend label. Its rows are placed from
+// the theme's metrics, so the card keeps its proportions at every density.
+func MetricCard(canvas *gfx.Canvas, theme gfx.Theme, bounds gfx.Rect, title, value, trend string, positive bool) {
+	metrics := theme.Metrics
+	pad := metrics.PadSurface
+	Card(canvas, theme, bounds)
+
+	smallHeight := metrics.FontSizeS + 9
+	valueSize := metrics.FontSizeL - 2
+	valueHeight := valueSize + 12
+	titleY := bounds.Y + pad*0.75
+	valueY := titleY + smallHeight + metrics.GapItem*0.625
+	trendY := valueY + valueHeight + metrics.GapItem*1.125
+	width := bounds.Width - pad*2
+
+	canvas.Label(title, gfx.Rect{X: bounds.X + pad, Y: titleY, Width: width, Height: smallHeight}, gfx.TextStyle{
+		Size: metrics.FontSizeS, Weight: gfx.WeightMedium, Color: theme.MutedForeground,
+	})
+	canvas.Label(value, gfx.Rect{X: bounds.X + pad, Y: valueY, Width: width, Height: valueHeight}, gfx.TextStyle{
+		Size: valueSize, Weight: gfx.WeightSemibold, Color: theme.Foreground,
+	})
+	trendColor := theme.Danger
+	if positive {
+		trendColor = theme.Success
+	}
+	canvas.Label(trend, gfx.Rect{X: bounds.X + pad, Y: trendY, Width: width, Height: smallHeight}, gfx.TextStyle{
+		Size: metrics.FontSizeS, Weight: gfx.WeightMedium, Color: trendColor,
+	})
+}

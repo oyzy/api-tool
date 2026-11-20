@@ -1,0 +1,271 @@
+package app
+
+import (
+	"math"
+	"strings"
+
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/internal/platform"
+)
+
+// WindowControlWidth is the width in logical pixels of each of the minimize,
+// maximize and close buttons Viva draws in a custom titlebar. They are as tall as
+// Config.TitlebarHeight.
+const WindowControlWidth = platform.WindowControlWidth
+
+// windowControlsLayer is above every layer an application uses, so the buttons
+// stay in view and clickable under a dialog: a window can be closed or minimized
+// whatever it is showing.
+const windowControlsLayer = math.MaxUint16
+
+// The buttons, in the order they are painted. Their identities are names in a
+// feature of their own in the canvas's identity tree, so no application
+// identity can be one of them, and its Clicked never sees them.
+const (
+	windowControlMinimize = iota
+	windowControlMaximize
+	windowControlClose
+)
+
+// desktopTheme defines how Viva styles the window buttons to fit the desktop
+// environment.
+type desktopTheme uint8
+
+const (
+	desktopDefault desktopTheme = iota
+	desktopBreeze
+	desktopAdwaita
+)
+
+// detectDesktopTheme reports which theme best matches the desktop environment
+// named in desktop (typically from XDG_CURRENT_DESKTOP).
+func detectDesktopTheme(desktop string) desktopTheme {
+	desktop = strings.ToUpper(desktop)
+	if strings.Contains(desktop, "KDE") || strings.Contains(desktop, "PLASMA") {
+		return desktopBreeze
+	}
+	if strings.Contains(desktop, "GNOME") || strings.Contains(desktop, "UNITY") || strings.Contains(desktop, "PANTHEON") {
+		return desktopAdwaita
+	}
+	return desktopDefault
+}
+
+// WindowControlsStyle is how the window buttons look. A zero field takes a
+// default that suits Config.ClearColor.
+type WindowControlsStyle struct {
+	// Foreground is the glyph's color, Hover the button's background under the
+	// pointer, and Pressed while it is held down.
+	Foreground, Hover, Pressed gfx.Color
+	// Close is the close button's background under the pointer, and
+	// CloseForeground its glyph then. Pressed fades it.
+	Close, CloseForeground gfx.Color
+	// Names are what assistive technology calls the buttons. They default to
+	// English; an application that is translated sets them.
+	Minimize, Maximize, Restore, CloseName string
+}
+
+// withDefaults fills what style leaves out for a window cleared to clear.
+func (style WindowControlsStyle) withDefaults(clear Color) WindowControlsStyle {
+	luminance := 0.2126*clear.Red + 0.7152*clear.Green + 0.0722*clear.Blue
+	ink := gfx.Color{Red: 0.1, Green: 0.1, Blue: 0.1, Alpha: 1}
+	if luminance < 0.5 {
+		ink = gfx.Color{Red: 0.95, Green: 0.95, Blue: 0.95, Alpha: 1}
+	}
+	if style.Foreground == (gfx.Color{}) {
+		style.Foreground = ink
+	}
+	if style.Hover == (gfx.Color{}) {
+		style.Hover = gfx.Color{Red: ink.Red, Green: ink.Green, Blue: ink.Blue, Alpha: 0.10}
+	}
+	if style.Pressed == (gfx.Color{}) {
+		style.Pressed = gfx.Color{Red: ink.Red, Green: ink.Green, Blue: ink.Blue, Alpha: 0.18}
+	}
+	if style.Close == (gfx.Color{}) {
+		style.Close = gfx.Color{Red: 0.77, Green: 0.17, Blue: 0.11, Alpha: 1}
+	}
+	if style.CloseForeground == (gfx.Color{}) {
+		style.CloseForeground = gfx.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1}
+	}
+	if style.Minimize == "" {
+		style.Minimize = "Minimize"
+	}
+	if style.Maximize == "" {
+		style.Maximize = "Maximize"
+	}
+	if style.Restore == "" {
+		style.Restore = "Restore"
+	}
+	if style.CloseName == "" {
+		style.CloseName = "Close"
+	}
+	return style
+}
+
+// The glyphs are ten units square and stroked one unit wide, which is one
+// device pixel at 1x and two at 2x.
+const glyph = 10
+
+var (
+	minimizeIcon = gfx.Icon{ViewBox: glyph, Stroke: 1, Cap: gfx.CapButt, Join: gfx.JoinMiter, Commands: []gfx.PathCommand{
+		gfx.MoveTo(0, 5), gfx.LineTo(glyph, 5),
+	}}
+	maximizeIcon = gfx.Icon{ViewBox: glyph, Stroke: 1, Cap: gfx.CapButt, Join: gfx.JoinMiter, Commands: []gfx.PathCommand{
+		gfx.MoveTo(0.5, 0.5), gfx.LineTo(9.5, 0.5), gfx.LineTo(9.5, 9.5), gfx.LineTo(0.5, 9.5), gfx.ClosePath(),
+	}}
+	restoreIcon = gfx.Icon{ViewBox: glyph, Stroke: 1, Cap: gfx.CapButt, Join: gfx.JoinMiter, Commands: []gfx.PathCommand{
+		// The window behind: its top and right edges, clear of the one in front.
+		gfx.MoveTo(2.5, 2.5), gfx.LineTo(2.5, 0.5), gfx.LineTo(9.5, 0.5), gfx.LineTo(9.5, 7.5), gfx.LineTo(7.5, 7.5),
+		// The window in front.
+		gfx.MoveTo(0.5, 2.5), gfx.LineTo(7.5, 2.5), gfx.LineTo(7.5, 9.5), gfx.LineTo(0.5, 9.5), gfx.ClosePath(),
+	}}
+	closeIcon = gfx.Icon{ViewBox: glyph, Stroke: 1, Cap: gfx.CapButt, Join: gfx.JoinMiter, Commands: []gfx.PathCommand{
+		gfx.MoveTo(0, 0), gfx.LineTo(glyph, glyph), gfx.MoveTo(glyph, 0), gfx.LineTo(0, glyph),
+	}}
+)
+
+// windowControls paints the buttons and carries out their clicks. One belongs to
+// a window whose system draws no controls for it.
+type windowControls struct {
+	style   func() WindowControlsStyle
+	clear   Color
+	height  float32
+	theme   desktopTheme
+	actions *platform.WindowActions
+	// tree and ids are the buttons' identities in the tree they were made in.
+	tree *gfx.Tree
+	ids  [3]gfx.ID
+}
+
+func newWindowControls(config *Config) *windowControls {
+	return &windowControls{
+		style:  config.WindowControls,
+		clear:  config.ClearColor,
+		height: platform.Config{TitlebarHeight: config.TitlebarHeight}.TitlebarStrip(),
+		theme:  currentDesktopTheme(),
+	}
+}
+
+// maximized reports whether the window fills its screen, which has no edges to
+// resize from.
+func (controls *windowControls) maximized() bool {
+	return controls.actions != nil && controls.actions.Maximized != nil && controls.actions.Maximized()
+}
+
+// identify names the buttons in tree. It does nothing after the first time for
+// one tree.
+func (controls *windowControls) identify(tree *gfx.Tree) {
+	if controls.tree == tree {
+		return
+	}
+	scope := tree.Feature("viva.window-controls")
+	controls.ids = [3]gfx.ID{
+		scope.ID(tree.Name("minimize")), scope.ID(tree.Name("maximize")), scope.ID(tree.Name("close")),
+	}
+	controls.tree = tree
+}
+
+// control reports which button id is, and false for any other identity.
+func (controls *windowControls) control(id gfx.ID) (int, bool) {
+	for index, candidate := range controls.ids {
+		if candidate == id && !id.IsZero() {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+// paint draws the three buttons at the trailing end of the strip and declares
+// their hits. It runs after the application's own paint.
+func (controls *windowControls) paint(canvas *gfx.Canvas, size gfx.Size) {
+	style := WindowControlsStyle{}
+	if controls.style != nil {
+		style = controls.style()
+	}
+	style = style.withDefaults(controls.clear)
+	maximized := controls.maximized()
+	controls.identify(canvas.Tree())
+
+	canvas.PushLayer(windowControlsLayer)
+	// Under a modal dialog the buttons join its focus scope, or the dialog would
+	// shut them out; they are not part of its keyboard order.
+	trapped := canvas.TrappedFocusScope()
+	if !trapped.IsZero() {
+		canvas.PushFocusScope(trapped)
+	}
+	hovered, pressed := canvas.Hovered(), canvas.Pressed()
+	for index, id := range controls.ids {
+		bounds := gfx.Rect{X: size.Width - float32(3-index)*WindowControlWidth, Width: WindowControlWidth, Height: controls.height}
+		icon, name, tint := minimizeIcon, style.Minimize, style.Foreground
+		switch index {
+		case windowControlMaximize:
+			icon, name = maximizeIcon, style.Maximize
+			if maximized {
+				icon, name = restoreIcon, style.Restore
+			}
+		case windowControlClose:
+			icon, name = closeIcon, style.CloseName
+		}
+		var (
+			bg    gfx.Color
+			hasBg bool
+		)
+		switch {
+		case index == windowControlClose && (pressed == id || hovered == id):
+			bg = style.Close
+			if pressed == id {
+				bg.Alpha *= 0.8
+			}
+			hasBg = true
+			tint = style.CloseForeground
+		case pressed == id:
+			bg = style.Pressed
+			hasBg = true
+		case hovered == id:
+			bg = style.Hover
+			hasBg = true
+		}
+		if hasBg {
+			if controls.theme == desktopBreeze || controls.theme == desktopAdwaita {
+				btnSize := max(float32(16), min(float32(26), controls.height-6))
+				btnRect := gfx.Rect{
+					X:      bounds.X + (bounds.Width-btnSize)/2,
+					Y:      (controls.height - btnSize) / 2,
+					Width:  btnSize,
+					Height: btnSize,
+				}
+				canvas.Rounded(btnRect, btnSize/2, bg)
+			} else {
+				canvas.Fill(bounds, bg)
+			}
+		}
+		canvas.DrawIcon(icon, gfx.Rect{X: bounds.X + (WindowControlWidth-glyph)/2, Y: (controls.height - glyph) / 2, Width: glyph, Height: glyph}, tint)
+		canvas.HitWithOptions(id, bounds, name, gfx.HitOptions{Role: gfx.RoleButton, SkipFocus: true})
+	}
+	if !trapped.IsZero() {
+		canvas.PopFocusScope()
+	}
+	canvas.PopLayer()
+}
+
+// activate carries out a click on one of the buttons.
+func (controls *windowControls) activate(id gfx.ID) {
+	actions := controls.actions
+	if actions == nil {
+		return
+	}
+	which, _ := controls.control(id)
+	switch which {
+	case windowControlMinimize:
+		if actions.Minimize != nil {
+			actions.Minimize()
+		}
+	case windowControlMaximize:
+		if actions.ToggleMaximize != nil {
+			actions.ToggleMaximize()
+		}
+	case windowControlClose:
+		if actions.RequestClose != nil {
+			actions.RequestClose()
+		}
+	}
+}

@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+      - name: Build (GUI subsystem)
+        run: |
+          go build -trimpath -ldflags "-H=windowsgui" -o apitool.exe .
+          go run ./tools/patchicon
+          mv apitool.exe apitool-windows-amd64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apitool-windows-amd64
+          path: apitool-windows-amd64.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -o apitool-linux-amd64 .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apitool-linux-amd64
+          path: apitool-linux-amd64
+
+  macos-arm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+      - name: Build (Apple Silicon)
+        run: go build -trimpath -o apitool-darwin-arm64 .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apitool-darwin-arm64
+          path: apitool-darwin-arm64
+
+  macos-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+      - name: Build (Intel)
+        run: go build -trimpath -o apitool-darwin-amd64 .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apitool-darwin-amd64
+          path: apitool-darwin-amd64
+
+  release:
+    needs: [windows, linux, macos-arm, macos-intel]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes

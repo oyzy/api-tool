@@ -1,0 +1,340 @@
+package app
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/vivaui/viva/gfx"
+)
+
+// ErrNoWindows is returned when an application startup callback returns
+// without opening a window. A native application must always have at least one
+// explicit owner for its event loop.
+var ErrNoWindows = errors.New("app: application opened no windows")
+
+// WindowControl is what a Host gives back for a window it opened. All of them
+// are safe to call from any goroutine and act on the event-loop thread.
+// A fullscreen-capable host additionally implements SetFullscreen(bool) error
+// and Fullscreen() bool. It reports transitions through Config.OnFullscreen
+// before resize/frame callbacks and repaints afterward.
+// An always-on-top host additionally implements SetAlwaysOnTop(bool) error.
+// A size-capable host additionally implements SetSize(int, int) error.
+type WindowControl interface {
+	Close()
+	Hide()
+	Show()
+	// Frame is the content area in screen coordinates, false when the window
+	// cannot say (closed, or not yet placed). It may be called from any goroutine.
+	Frame() (gfx.Rect, bool)
+}
+
+// Host is the event loop an Application runs on. The native backends provide
+// one over their platform adapters; a development runner such as package
+// headless provides one to drive an application without a window.
+type Host interface {
+	// OpenWindow creates and presents a window. closed must be called exactly
+	// once, after the window has released its resources.
+	OpenWindow(config Config, canvas *gfx.Canvas, closed func()) (WindowControl, error)
+	// AddStatusItem puts an icon in the system's status area.
+	AddStatusItem(config StatusItemConfig) (StatusItemControl, error)
+	// SetDockBadge marks the application's icon in the Dock with text.
+	SetDockBadge(text string)
+	// SetProgress draws how much of the application's work is done on the icon
+	// the desktop shows for it.
+	SetProgress(fraction float32)
+	// Quit closes every window, close requests notwithstanding, and ends the
+	// loop. It is safe to call from any goroutine.
+	Quit()
+	// Post runs fn on the application's event-loop thread. It is safe from any
+	// goroutine and never blocks.
+	Post(fn func())
+}
+
+// Post runs fn on the application's event-loop thread. Use it to hand work a
+// background goroutine finished to the thread that owns the windows, the pages
+// and the retained scene. It is safe from any goroutine, never blocks, and the
+// functions it accepts run in the order Post accepted them; a function posted
+// after the loop has ended may not run.
+//
+// A posted function runs on the loop thread and must not wait for the loop: it
+// is the same thread that would have to run the work it waits on. Viva provides
+// no "call the loop and wait" form for that reason; a result is published where
+// the next Window wake or Paint reads it, as Config.OnWake and
+// Invalidator.Invalidate already arrange.
+//
+// It starts no goroutine: the adapter wakes the loop it already has.
+func (application *Application) Post(fn func()) {
+	if application == nil || application.host == nil || fn == nil {
+		return
+	}
+	application.host.Post(fn)
+}
+
+// Window is one independently retained native window. Close is idempotent and
+// may be called from a window callback or another goroutine; the platform
+// adapter performs the actual close on its native event-loop thread.
+type Window struct {
+	closeOnce sync.Once
+	control   WindowControl
+	closed    atomic.Bool
+	hidden    atomic.Bool
+	// minimized mirrors what the platform last reported through OnMinimize.
+	minimized atomic.Bool
+	// maximized mirrors what the platform last reported through OnMaximize.
+	maximized  atomic.Bool
+	fullscreen atomic.Bool
+	topmostMu  sync.Mutex
+	topmost    atomic.Bool
+}
+
+// Close requests that the native window close. Closing the final window ends
+// RunApplication after all platform resources have been released.
+func (window *Window) Close() {
+	if window == nil || window.closed.Load() {
+		return
+	}
+	window.closeOnce.Do(func() {
+		if window.control != nil {
+			window.control.Close()
+		}
+	})
+}
+
+// Hide takes the window off the screen without closing it. Its content, state
+// and GPU resources stay, and the application keeps running while it is the
+// only window, which is how an application stays in the status area after the
+// user closes its main window. Hiding a hidden or closed window does nothing.
+func (window *Window) Hide() {
+	if window == nil || window.closed.Load() || window.hidden.Swap(true) {
+		return
+	}
+	window.control.Hide()
+}
+
+// Show puts the window back on the screen in front of the others and brings
+// the application forward. Showing a window already on screen raises it.
+func (window *Window) Show() {
+	if window == nil || window.closed.Load() {
+		return
+	}
+	window.hidden.Store(false)
+	window.control.Show()
+}
+
+// Frame returns the window's content area in screen coordinates: logical pixels
+// from the top-left corner of the primary display, y down, the coordinates
+// gfx.PointerEvent.ScreenX and ScreenY use. A drag that ends over another of the
+// application's windows finds it by comparing its pointer with their frames. The
+// result is false for a closed window. On displays of different scale the
+// coordinates of windows on different displays are only approximately comparable.
+// It may be called from any goroutine.
+func (window *Window) Frame() (gfx.Rect, bool) {
+	if window == nil || window.control == nil || window.closed.Load() {
+		return gfx.Rect{}, false
+	}
+	return window.control.Frame()
+}
+
+// Hidden reports whether Hide took the window off the screen and Show has not
+// put it back. A macOS Dock reopen also goes through Show.
+func (window *Window) Hidden() bool {
+	return window != nil && window.hidden.Load()
+}
+
+// Minimized reports whether the window manager has the window minimized: in the
+// Dock, the taskbar, or the desktop's icon area. It follows the state the
+// platform last reported to OnMinimize, so it changes while the window is
+// hidden too. It may be called from any goroutine.
+func (window *Window) Minimized() bool {
+	return window != nil && window.minimized.Load()
+}
+
+// Maximized reports whether the window manager has the window maximized.
+// It follows the state the platform last reported to OnMaximize on Windows
+// and Linux, so it changes while the window is hidden too. On platforms
+// without a maximization state (such as macOS), it reports false. It may
+// be called from any goroutine.
+func (window *Window) Maximized() bool {
+	return window != nil && window.maximized.Load()
+}
+
+// shortcutCapturer is what a window control offers when its platform can take the system's
+// shortcuts for the window.
+type shortcutCapturer interface {
+	CaptureSystemShortcuts(capture bool) error
+}
+
+// CaptureSystemShortcuts asks the system to hand this window the shortcuts it normally keeps for
+// itself (the Windows key and its chords, Alt+Tab, Ctrl+Esc) while the window has the keyboard
+// focus, so that they reach the window as ordinary keys instead of switching tasks or opening a
+// menu. A remote desktop or a virtual machine shows the same shortcuts to its own system this
+// way. Another window, or this one without the focus, keeps the system's behavior, and
+// CaptureSystemShortcuts(false) gives them back at once; a closed window gives them back too.
+// The call may come from any goroutine.
+//
+// An error wrapping ErrUnsupported means this platform cannot take them yet. Windows is the one
+// that does today; macOS and Linux still keep their shortcuts for the system.
+func (window *Window) CaptureSystemShortcuts(capture bool) error {
+	if window == nil || window.closed.Load() {
+		return fmt.Errorf("app: window is closed")
+	}
+	capturer, ok := window.control.(shortcutCapturer)
+	if !ok {
+		return fmt.Errorf("%w: this platform keeps the system's shortcuts", ErrUnsupported)
+	}
+	return capturer.CaptureSystemShortcuts(capture)
+}
+
+// Closed reports whether the platform has finished closing the window.
+func (window *Window) Closed() bool {
+	return window == nil || window.closed.Load()
+}
+
+// Application owns the native event loop and all windows created in one
+// RunApplication call. OpenWindow must be called from the startup callback or
+// a window callback, both of which run on the native event-loop thread.
+type Application struct {
+	host      Host
+	mu        sync.Mutex
+	windows   map[*Window]struct{}
+	openedAny bool
+}
+
+// OpenWindow creates and presents one independent retained window.
+func (application *Application) OpenWindow(config Config, canvas *gfx.Canvas) (*Window, error) {
+	if application == nil || application.host == nil {
+		return nil, errors.New("app: application is not running")
+	}
+	window := &Window{}
+	application.mu.Lock()
+	if application.windows == nil {
+		application.windows = make(map[*Window]struct{})
+	}
+	application.windows[window] = struct{}{}
+	application.mu.Unlock()
+	liveWindows.Acquire()
+	forget := sync.OnceFunc(func() {
+		application.mu.Lock()
+		delete(application.windows, window)
+		application.mu.Unlock()
+		liveWindows.Release()
+	})
+	closed := func() {
+		window.closed.Store(true)
+		forget()
+	}
+	// The runtime tracks the minimize state for every window, so Window.Minimized
+	// answers even when the application did not ask for OnMinimize. There is no
+	// minimize event during OpenWindow, so the zero value is the initial state.
+	onMinimize := config.OnMinimize
+	config.OnMinimize = func(minimized bool) {
+		window.minimized.Store(minimized)
+		if onMinimize != nil {
+			onMinimize(minimized)
+		}
+	}
+	onMaximize := config.OnMaximize
+	config.OnMaximize = func(maximized bool) {
+		window.maximized.Store(maximized)
+		if onMaximize != nil {
+			onMaximize(maximized)
+		}
+	}
+	setReopenHandler(&config, window)
+	onFullscreen := config.OnFullscreen
+	config.OnFullscreen = func(fullscreen bool) {
+		window.fullscreen.Store(fullscreen)
+		if onFullscreen != nil {
+			onFullscreen(fullscreen)
+		}
+	}
+	control, err := application.host.OpenWindow(config, canvas, closed)
+	if err != nil {
+		forget()
+		return nil, err
+	}
+	window.control = control
+	application.mu.Lock()
+	application.openedAny = true
+	application.mu.Unlock()
+	return window, nil
+}
+
+// AddStatusItem puts an icon in the system's status area. It is called from the
+// startup callback or a window callback, like OpenWindow.
+func (application *Application) AddStatusItem(config StatusItemConfig) (*StatusItem, error) {
+	if application == nil || application.host == nil {
+		return nil, errors.New("app: application is not running")
+	}
+	if err := config.Icon.validate(); err != nil {
+		return nil, err
+	}
+	control, err := application.host.AddStatusItem(config)
+	if err != nil {
+		return nil, err
+	}
+	return &StatusItem{control: control}, nil
+}
+
+// SetDockBadge marks the application's Dock icon with text, the red badge macOS
+// draws at the top corner of the tile. It says something the whole application
+// is waiting on, not one window's state: a mail client's unread count, or the
+// mark of a development build. An empty text removes the badge. It is called
+// from the startup callback or a window callback, like OpenWindow; a desktop
+// without a Dock accepts it and does nothing.
+func (application *Application) SetDockBadge(text string) {
+	if application != nil && application.host != nil {
+		application.host.SetDockBadge(text)
+	}
+}
+
+// SetProgress draws how much of the work the application is doing is done on
+// the icon the desktop shows for it: the Dock tile on macOS, the taskbar button
+// on Windows, the launcher entry of a Linux desktop that has one. A fraction
+// between 0 and 1 draws a bar of that length; a fraction below zero, or one that
+// is not a number, takes the bar away, which is also how a program says the work
+// is over. It describes the whole application rather than one window, so a
+// program with several windows reports what all of them are moving. It is called
+// from the startup callback or a window callback, like SetDockBadge; a desktop
+// with nowhere to draw the bar accepts it and does nothing.
+func (application *Application) SetProgress(fraction float32) {
+	if application == nil || application.host == nil {
+		return
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+	application.host.SetProgress(fraction)
+}
+
+// Quit closes every window, whatever their close requests say, and ends
+// RunApplication once their resources are released. It may be called from any
+// goroutine.
+func (application *Application) Quit() {
+	if application != nil && application.host != nil {
+		application.host.Quit()
+	}
+}
+
+func (application *Application) hasOpenedWindow() bool {
+	application.mu.Lock()
+	defer application.mu.Unlock()
+	return application.openedAny
+}
+
+// ApplicationRunner replaces the native multi-window event loop for a
+// development tool. Normal release applications never install one.
+type ApplicationRunner func(start func(host Host) error) error
+
+var applicationRunner ApplicationRunner
+
+// UseApplicationRunner makes RunApplication use run instead of native windows.
+// Package headless/auto installs this only in explicitly tagged tool builds.
+func UseApplicationRunner(run ApplicationRunner) {
+	if run != nil {
+		markNonNativeSystemUsed()
+	}
+	applicationRunner = run
+}
