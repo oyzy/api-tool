@@ -669,9 +669,10 @@ func (m *model) page(c ui.C) {
 	m.dataDirDialog(c)
 }
 
-// openDataDirDialog prefills the switch dialog with the store's directory.
+// openDataDirDialog opens the switch dialog with nothing chosen yet: the
+// location comes from the folder picker or the 恢复默认位置 button.
 func (m *model) openDataDirDialog() {
-	m.dataDirNew = storeFile()
+	m.dataDirNew = ""
 	m.dataDirOpen = true
 }
 
@@ -700,31 +701,54 @@ func (m *model) switchDataDir(dir string) error {
 	return nil
 }
 
-// dataDirDialog asks where the store should live and moves the app over.
+// dataDirDialog asks where the store should live and moves the app over. The
+// new location comes from the system folder picker — nothing to type.
 func (m *model) dataDirDialog(c ui.C) {
 	ui.Modal(c, &m.dataDirOpen, "数据目录", func() {
+		theme := c.Theme()
 		ui.Column(c).Gap(10).Children(func() {
 			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
 				ui.Text(c, "当前").Muted()
 				ui.Text(c, storeFile()).Mono().FontSize(12).Grow(1).Ellipsis()
 			})
-			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
-				ui.Text(c, "新目录").Muted()
-				ui.TextField(c, &m.dataDirNew, "新目录", "留空恢复默认位置").Grow(1)
-				if ui.Button(c, "浏览…").Small().Outline().Clicked() {
+			ui.Row(c).Gap(8).Children(func() {
+				if ui.Button(c, "选择文件夹…").Icon(icoFolder).Clicked() {
 					if dir, err := app.OpenDirectory(app.OpenDirectoryOptions{Title: "选择数据目录"}); err == nil && dir != "" {
-						c.After(func() { m.dataDirNew = dir })
+						picked := filepath.Join(dir, "data.json")
+						c.After(func() {
+							m.dataDirNew = picked
+							if m.inv != nil {
+								m.inv.Invalidate()
+							}
+						})
 					}
 				}
+				if ui.Button(c, "恢复默认位置").Small().Ghost().Clicked() {
+					c.After(func() {
+						m.dataDirNew = storePath()
+						if m.inv != nil {
+							m.inv.Invalidate()
+						}
+					})
+				}
 			})
-			ui.Text(c, "切换后立即从新目录读取，原目录的文件保留不动。").Muted().FontSize(12)
+			// what the picker chose, or a hint that nothing is chosen yet
+			if m.dataDirNew != "" {
+				ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+					ui.Text(c, "✓").Color(theme.Success).Bold()
+					ui.Text(c, m.dataDirNew).Mono().FontSize(12).Grow(1).Ellipsis()
+				})
+			} else {
+				ui.Text(c, "先从电脑里选一个文件夹，data.json 会放在里面。").Muted().FontSize(12)
+			}
+			ui.Text(c, "切换后立即从新位置读取，原目录的文件保留不动。").Muted().FontSize(12)
 		})
 	}, func() {
 		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
 			if ui.Button(c, "取消").Outline().Clicked() {
 				m.dataDirOpen = false
 			}
-			if ui.Button(c, "切换并重新加载").Clicked() {
+			if ui.Button(c, "切换并重新加载").Disabled(m.dataDirNew == "").Clicked() {
 				m.dataDirOpen = false
 				c.After(func() {
 					if err := m.switchDataDir(m.dataDirNew); err != nil {

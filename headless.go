@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/vivaui/viva/headless/auto"
+	_ "github.com/vivaui/viva/headless/auto"
 )
 
 func init() {
