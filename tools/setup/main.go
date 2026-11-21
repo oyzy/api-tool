@@ -22,11 +22,15 @@ import (
 
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/tools/winpkg"
 	"github.com/vivaui/viva/ui"
 )
 
 //go:embed apitool.exe
 var appExe []byte
+
+//go:embed icon.png
+var iconPNG []byte
 
 const (
 	appName      = "ApiTool"
@@ -184,6 +188,19 @@ func installTo(dir string, desktop, startMenu bool) error {
 	if err := os.WriteFile(filepath.Join(dir, "apitool.exe"), appExe, 0o644); err != nil {
 		return err
 	}
+	// A dedicated .ico file is the shortcut's icon source: pointing a fresh
+	// .lnk at an exe written moments ago can pick up a stale Windows icon
+	// cache entry (a generic sheet), while this path is new to the cache.
+	icoPath := filepath.Join(dir, "apitool.ico")
+	icoOK := false
+	if tmp := filepath.Join(os.TempDir(), "apitool-icon.png"); os.WriteFile(tmp, iconPNG, 0o644) == nil {
+		if ico, _, err := winpkg.LoadIcon(tmp); err == nil && len(ico) > 0 {
+			if os.WriteFile(icoPath, ico, 0o644) == nil {
+				icoOK = true
+			}
+		}
+		_ = os.Remove(tmp)
+	}
 	self, err := os.Executable()
 	if err == nil {
 		if b, err := os.ReadFile(self); err == nil {
@@ -195,17 +212,20 @@ func installTo(dir string, desktop, startMenu bool) error {
 	}
 	if startMenu {
 		menu := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs")
-		makeShortcut(filepath.Join(menu, "ApiTool.lnk"), dir)
+		makeShortcut(filepath.Join(menu, "ApiTool.lnk"), dir, icoOK, icoPath)
 	}
 	if desktop {
-		makeShortcut(filepath.Join(desktopFolder(), "ApiTool.lnk"), dir)
+		makeShortcut(filepath.Join(desktopFolder(), "ApiTool.lnk"), dir, icoOK, icoPath)
 	}
+	// Refresh the shell's icon caches, or a shortcut can show whatever was
+	// cached for these paths before.
+	_ = exec.Command("ie4uinit.exe", "-show").Run()
 	for _, v := range [][2]string{
 		{"DisplayName", "ApiTool"},
 		{"DisplayVersion", appVersion},
 		{"Publisher", "oyzy"},
 		{"InstallLocation", dir},
-		{"DisplayIcon", filepath.Join(dir, "apitool.exe")},
+		{"DisplayIcon", iconSource(dir, icoOK, icoPath)},
 		{"UninstallString", `"` + filepath.Join(dir, "uninstall.exe") + `" -uninstall`},
 	} {
 		_ = exec.Command("reg", "add", uninstallKey, "/v", v[0], "/t", "REG_SZ", "/d", v[1], "/f").Run()
@@ -238,10 +258,20 @@ func runUninstall() {
 }
 
 // makeShortcut lays a .lnk via the shell COM object PowerShell exposes.
-func makeShortcut(lnk, dir string) {
+func makeShortcut(lnk, dir string, icoOK bool, icoPath string) {
 	home := fmt.Sprintf("%s\\apitool.exe", dir)
-	ps := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.WorkingDirectory = '%s'; $s.IconLocation = '%s'; $s.Save()`, lnk, home, dir, home)
+	icon := iconSource(dir, icoOK, icoPath)
+	ps := fmt.Sprintf(`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.WorkingDirectory = '%s'; $s.IconLocation = '%s,0'; $s.Save()`, lnk, home, dir, icon)
 	_ = exec.Command("powershell", "-NoProfile", "-Command", ps).Run()
+}
+
+// iconSource is what shortcuts and the registry use as the app's icon: the
+// dedicated .ico when the install laid one down, else the exe itself.
+func iconSource(dir string, icoOK bool, icoPath string) string {
+	if icoOK {
+		return icoPath
+	}
+	return filepath.Join(dir, "apitool.exe")
 }
 
 // desktopFolder asks Windows where the desktop is (OneDrive may redirect it).

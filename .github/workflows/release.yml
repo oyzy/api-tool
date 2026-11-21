@@ -22,7 +22,9 @@ jobs:
           go run ./tools/patchicon
           cp apitool.exe apitool-windows-amd64.exe
           cp apitool.exe tools/setup/apitool.exe
+          cp icon.png tools/setup/icon.png
           go build -trimpath -ldflags "-H=windowsgui" -o apitool-windows-amd64-setup.exe ./tools/setup
+          go run ./tools/patchicon apitool-windows-amd64-setup.exe
       - name: Zip the portable build
         shell: pwsh
         run: Compress-Archive -Path apitool-windows-amd64.exe -DestinationPath apitool-windows-amd64.zip -Force
