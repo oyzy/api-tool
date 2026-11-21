@@ -133,14 +133,17 @@ func storePath() string {
 }
 
 // loadStore reads the data file, returning an empty store when it is missing
-// or unreadable.
+// or unreadable. A file that fails to parse (a torn write, say) falls back to
+// the .bak the previous save left behind, so one bad write cannot lose data.
 func loadStore() storeData {
 	data := storeData{}
 	b, err := os.ReadFile(storeFile())
-	if err != nil {
-		return data
+	if err != nil || json.Unmarshal(b, &data) != nil {
+		data = storeData{}
+		if b, err = os.ReadFile(storeFile() + ".bak"); err != nil || json.Unmarshal(b, &data) != nil {
+			data = storeData{}
+		}
 	}
-	_ = json.Unmarshal(b, &data)
 	// Migrate a legacy single env list into the multi-env format.
 	if len(data.EnvSets) == 0 && len(data.Envs) > 0 {
 		data.EnvSets = []envSet{{Name: "默认", Vars: data.Envs}}
@@ -165,7 +168,9 @@ func loadStore() storeData {
 	return data
 }
 
-// saveStore writes the data file, creating its directory when needed.
+// saveStore writes the data file, creating its directory when needed. The
+// write is atomic (temp file + rename) and the previous version is kept as
+// .bak, so a crash or a torn write never takes the store down with it.
 func saveStore(data storeData) {
 	path := storeFile()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -175,7 +180,13 @@ func saveStore(data storeData) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, b, 0o644)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return
+	}
+	_ = os.Remove(path + ".bak")
+	_ = os.Rename(path, path+".bak") // the previous store becomes the backup
+	_ = os.Rename(tmp, path)         // rename within a volume is atomic
 }
 
 // toSaved builds a savedRequest from the tab's request.

@@ -25,8 +25,10 @@ import (
 func TestMain(m *testing.M) {
 	dataPath = filepath.Join(os.TempDir(), "apitool-test-data.json")
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	code := m.Run()
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	os.Exit(code)
 }
 
@@ -564,6 +566,7 @@ func TestCollectionGroups(t *testing.T) {
 
 func TestEmptyGroupPersists(t *testing.T) {
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	m := newModel()
 	m.groups = []string{"空组"}
 	m.rebuildCollRows()
@@ -734,6 +737,7 @@ func TestEnvRename(t *testing.T) {
 
 func TestEditCollectionEntry(t *testing.T) {
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	m := newModel()
 	m.groups = []string{"服务"}
 	m.rebuildCollRows()
@@ -790,7 +794,8 @@ func TestEditCollectionEntry(t *testing.T) {
 }
 
 func TestCollectionSearch(t *testing.T) {
-	_ = os.Remove(dataPath) // a fresh store: earlier tests may have persisted groups
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted groups
 	m := newModel()
 	m.collections = []savedRequest{
 		{Name: "获取用户"},
@@ -929,6 +934,7 @@ func TestDragReorder(t *testing.T) {
 
 func TestNestedGroups(t *testing.T) {
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	m := newModel()
 	m.groups = []string{"G1", "G1/子"}
 	m.collections = []savedRequest{
@@ -1198,6 +1204,7 @@ func TestSaveResponseToFile(t *testing.T) {
 
 func TestCollectionsExportImportRoundTrip(t *testing.T) {
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	m := newModel()
 	m.groups = []string{"G1", "G1/子"}
 	m.collections = []savedRequest{
@@ -1450,7 +1457,8 @@ func TestTabDirtyAndDuplicate(t *testing.T) {
 // active, and baselines that keep the URL from rewriting itself on the first
 // paint.
 func TestTabsPersistAcrossRestart(t *testing.T) {
-	_ = os.Remove(dataPath) // a fresh store: earlier tests may have persisted tabs
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted tabs
 	m := newModel()
 	m.collections = nil
 
@@ -1634,6 +1642,7 @@ func TestThemePresets(t *testing.T) {
 	}
 
 	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 	m := newModel()
 	m.setTheme(3)
 	if m.theme.Background != themePresets[3].build().Background {
@@ -1736,8 +1745,49 @@ func TestUpdateCheck(t *testing.T) {
 // server.
 var srvAssetBase string
 
+// TestStoreAtomicAndBackup: a save leaves the previous store as .bak, and a
+// store file that fails to parse falls back to that backup instead of
+// presenting an empty world.
+func TestStoreAtomicAndBackup(t *testing.T) {
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+	_ = os.Remove(dataPath + ".bak")
+
+	m := newModel()
+	m.collections = nil
+	m.collections = append(m.collections, savedRequest{Name: "第一版"})
+	m.persist()
+	if b, err := os.ReadFile(dataPath); err != nil || !strings.Contains(string(b), "第一版") {
+		t.Fatalf("first save missing: %v", err)
+	}
+
+	// the next save moves the first version to .bak
+	m.collections[0].Name = "第二版"
+	m.persist()
+	bak, err := os.ReadFile(dataPath + ".bak")
+	if err != nil || !strings.Contains(string(bak), "第一版") {
+		t.Fatalf(".bak = %v, want the previous version", err)
+	}
+	live, _ := os.ReadFile(dataPath)
+	if !strings.Contains(string(live), "第二版") {
+		t.Fatal("live store was not updated")
+	}
+
+	// a torn write falls back to the .bak on load: the version before the
+	// latest save, never an empty world
+	_ = os.WriteFile(dataPath, []byte(`{"collections": [ {"Name"`), 0o644) // truncated
+	m2 := newModel()
+	if len(m2.collections) != 1 || m2.collections[0].Name != "第一版" {
+		t.Fatalf("restored from torn write = %+v, want 第一版 from .bak", m2.collections)
+	}
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+	_ = os.Remove(dataPath + ".bak")
+}
+
 func TestMultipleEnvs(t *testing.T) {
-	_ = os.Remove(dataPath) // a fresh store: earlier tests may have persisted sets
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets
 	m := newModel()
 	if len(m.envSets) != 1 {
 		t.Fatalf("expected 1 default env set, got %d", len(m.envSets))
