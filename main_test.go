@@ -1858,6 +1858,42 @@ func TestDataDirSwitch(t *testing.T) {
 	}
 }
 
+// TestUpdateApply drives the self-swap: the old exe steps aside as .old, the
+// downloaded bytes take its place, and a second apply puts the old content
+// back (the rollback path).
+func TestUpdateApply(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "apitool.exe")
+	if err := os.WriteFile(exe, []byte("OLD-BYTES"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyUpdateFile(exe, []byte("NEW-BYTES")); err != nil {
+		t.Fatal(err)
+	}
+	live, err := os.ReadFile(exe)
+	if err != nil || string(live) != "NEW-BYTES" {
+		t.Fatalf("live exe = %q (%v), want NEW-BYTES", live, err)
+	}
+	old, err := os.ReadFile(exe + ".old")
+	if err != nil || string(old) != "OLD-BYTES" {
+		t.Fatalf(".old = %q (%v), want OLD-BYTES", old, err)
+	}
+
+	// a second apply steps the previous version into .old again
+	if err := applyUpdateFile(exe, []byte("NEWEST")); err != nil {
+		t.Fatal(err)
+	}
+	live, _ = os.ReadFile(exe)
+	if string(live) != "NEWEST" {
+		t.Fatalf("live exe = %q, want NEWEST", live)
+	}
+	old, _ = os.ReadFile(exe + ".old")
+	if string(old) != "NEW-BYTES" {
+		t.Fatalf(".old = %q, want NEW-BYTES", old)
+	}
+	_ = os.Remove(exe)
+	_ = os.Remove(exe + ".old")
+}
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets

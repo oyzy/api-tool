@@ -108,14 +108,15 @@ type model struct {
 	dataDirNew       string
 
 	// update check
-	updateEff  *ui.EffectState[updateInfo, int]
-	updateSeq  int
-	updateInfo updateInfo
-	updateOpen bool
-	dlEff      *ui.EffectState[dlResult, string]
-	dlInfo     updateInfo
-	dlKey      string
-	dlSeq      int
+	updateEff   *ui.EffectState[updateInfo, int]
+	updateSeq   int
+	updateInfo  updateInfo
+	updateOpen  bool
+	dlEff       *ui.EffectState[dlResult, string]
+	dlInfo      updateInfo
+	dlKey       string
+	updateReady bool // the swap is on disk; only a restart is left
+	dlSeq       int
 
 	// collection runner
 	runEff     *ui.EffectState[httpResult, *outgoing]
@@ -307,7 +308,7 @@ func newModel() *model {
 		return fetchUpdate(ctx)
 	})
 	m.dlEff = ui.NewEffectKeyed[dlResult, string](func(ctx context.Context, _ string) (dlResult, error) {
-		return downloadAsset(ctx, m.dlInfo)
+		return downloadUpdate(ctx, m.dlInfo)
 	})
 	m.collTree.Node = m.collNodeAt
 	m.collNodeFn, m.collLabelFn, m.collContentFn = m.collNodeAt, m.collLabelAt, m.collRowContent
@@ -519,6 +520,7 @@ func main() {
 	page := ui.NewPage(ui.PageConfig{View: m.page, Theme: &m.theme})
 	cfg := page.Config(config())
 	m.inv = cfg.Invalidator
+	cleanupOldUpdate()
 	var canvas gfx.Canvas
 	err := app.RunCanvas(cfg, &canvas)
 	// closing the window is the last chance to checkpoint the open tabs — a
@@ -581,12 +583,14 @@ func (m *model) page(c ui.C) {
 	}
 	if m.dlKey != "" {
 		ui.Effect(c, m.dlEff, m.dlKey)
-		if r, err, ok := m.dlEff.Take(); ok {
+		if b, err, ok := m.dlEff.Take(); ok {
 			m.dlKey = ""
 			if err != nil {
 				m.toaster.Show("下载失败", err.Error(), ui.ToastError)
+			} else if err := applyUpdate(b); err != nil {
+				m.toaster.Show("更新失败", err.Error(), ui.ToastError)
 			} else {
-				m.toaster.Show("已下载", r.path+"，关闭当前程序后替换即可完成更新", ui.ToastSuccess)
+				m.updateReady = true
 			}
 		}
 	}
@@ -816,6 +820,12 @@ func (m *model) updateModal(c ui.C) {
 					ui.Text(c, "下载中…").Muted().FontSize(12)
 				})
 			}
+			if m.updateReady {
+				ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+					ui.Text(c, "✓").Bold().Color(c.Theme().Success)
+					ui.Text(c, "更新完成，重启后生效").FontSize(13)
+				})
+			}
 		})
 	}, func() {
 		info := m.updateInfo
@@ -825,11 +835,16 @@ func (m *model) updateModal(c ui.C) {
 					c.After(func() { _ = app.OpenURL(info.url) })
 				}
 			}
-			if info.assetURL != "" && m.dlKey == "" {
-				if ui.Button(c, "下载安装包").Clicked() {
+			if m.updateReady {
+				if ui.Button(c, "立即重启").Clicked() {
+					c.After(func() { restartApp() })
+				}
+			} else if info.assetURL != "" && m.dlKey == "" {
+				if ui.Button(c, "立即更新").Clicked() {
 					m.dlSeq++
 					info := m.updateInfo
-					c.After(func() { m.dlInfo, m.dlKey = info, fmt.Sprintf("%s#%d", info.assetURL, m.dlSeq) })
+					m.dlInfo = info
+					c.After(func() { m.dlKey = fmt.Sprintf("%s#%d", info.assetURL, m.dlSeq) })
 				}
 			}
 			if ui.Button(c, "关闭").Ghost().Clicked() {

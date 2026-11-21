@@ -49,20 +49,18 @@ type updateInfo struct {
 	err       string
 }
 
-// dlResult is one finished asset download.
-type dlResult struct {
-	path string
-	err  string
-}
+// dlResult is one finished asset download: the update's exe bytes in memory,
+// ready for applyUpdate.
+type dlResult = []byte
 
 // release is the slice of GitHub's release JSON the check reads.
 type release struct {
-	TagName    string       `json:"tag_name"`
-	HTMLURL    string       `json:"html_url"`
-	Body       string       `json:"body"`
-	Prerelease bool         `json:"prerelease"`
-	Draft      bool         `json:"draft"`
-	Assets     []relAsset   `json:"assets"`
+	TagName    string     `json:"tag_name"`
+	HTMLURL    string     `json:"html_url"`
+	Body       string     `json:"body"`
+	Prerelease bool       `json:"prerelease"`
+	Draft      bool       `json:"draft"`
+	Assets     []relAsset `json:"assets"`
 }
 
 type relAsset struct {
@@ -166,23 +164,12 @@ func fetchUpdate(ctx context.Context) (updateInfo, error) {
 	return info, nil
 }
 
-// downloadAsset fetches the release asset into the user's Downloads folder,
-// named after the version. Replacing the running exe stays a manual step: the
-// toast says where the file landed.
-func downloadAsset(ctx context.Context, info updateInfo) (dlResult, error) {
+// downloadUpdate fetches the release asset for this platform. The bytes stay
+// in memory; applyUpdate swaps them onto disk.
+func downloadUpdate(ctx context.Context, info updateInfo) ([]byte, error) {
 	if info.assetURL == "" {
-		return dlResult{}, fmt.Errorf("该版本没有当前平台的安装包")
+		return nil, fmt.Errorf("该版本没有当前平台的安装包")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return dlResult{}, err
-	}
-	name := info.assetName
-	if name == "" {
-		name = "apitool-" + strings.TrimPrefix(info.version, "v") + ".bin"
-	}
-	target := home + string(os.PathSeparator) + "Downloads" + string(os.PathSeparator) + name
-	res := dlResult{}
 	client := updateHTTPClient()
 	body, err := httpGet(ctx, client, info.assetURL)
 	if err != nil && runtime.GOOS == "windows" {
@@ -197,13 +184,52 @@ func downloadAsset(ctx context.Context, info updateInfo) (dlResult, error) {
 		}
 	}
 	if err != nil {
-		return res, err
+		return nil, err
 	}
-	if err := os.WriteFile(target, body, 0o644); err != nil {
-		return res, err
+	if info.size > 0 && int64(len(body)) != info.size {
+		return nil, fmt.Errorf("下载不完整: %d/%d 字节", len(body), info.size)
 	}
-	res.path = target
-	return res, nil
+	return body, nil
+}
+
+// applyUpdate swaps the downloaded exe over the running one: a running exe on
+// Windows can be RENAMED (the image stays mapped), so the old file steps aside
+// as .old and the new one takes its place. The caller restarts the app.
+func applyUpdate(b []byte) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return applyUpdateFile(exe, b)
+}
+
+// applyUpdateFile swaps b over the exe at exePath (see applyUpdate).
+func applyUpdateFile(exe string, b []byte) error {
+	old := exe + ".old"
+	_ = os.Remove(old)
+	if err := os.Rename(exe, old); err != nil {
+		return err
+	}
+	if err := os.WriteFile(exe, b, 0o755); err != nil {
+		_ = os.Rename(old, exe) // put the old one back
+		return err
+	}
+	return nil
+}
+
+// cleanupOldUpdate removes the .old file a previous update left behind.
+func cleanupOldUpdate() {
+	if exe, err := os.Executable(); err == nil {
+		_ = os.Remove(exe + ".old")
+	}
+}
+
+// restartApp launches the freshly updated exe and ends this one.
+func restartApp() {
+	if exe, err := os.Executable(); err == nil {
+		_ = exec.Command("cmd", "/c", "start", "", exe).Start()
+	}
+	os.Exit(0)
 }
 
 func httpGet(ctx context.Context, client *http.Client, target string) ([]byte, error) {
