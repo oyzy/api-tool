@@ -20,7 +20,7 @@ import (
 // which can open the release page or download the build for this platform.
 
 const (
-	appVersion = "0.1.3"
+	appVersion = "0.1.4"
 	repoURL    = "https://github.com/oyzy/api-tool"
 	repoSlug   = "oyzy/api-tool"
 )
