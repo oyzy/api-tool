@@ -20,11 +20,19 @@ jobs:
         run: |
           go build -trimpath -ldflags "-H=windowsgui" -o apitool.exe .
           go run ./tools/patchicon
-          mv apitool.exe apitool-windows-amd64.exe
+          cp apitool.exe apitool-windows-amd64.exe
+          cp apitool.exe tools/setup/apitool.exe
+          go build -trimpath -ldflags "-H=windowsgui" -o apitool-windows-amd64-setup.exe ./tools/setup
+      - name: Zip the portable build
+        shell: pwsh
+        run: Compress-Archive -Path apitool-windows-amd64.exe -DestinationPath apitool-windows-amd64.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: apitool-windows-amd64
-          path: apitool-windows-amd64.exe
+          path: |
+            apitool-windows-amd64.exe
+            apitool-windows-amd64-setup.exe
+            apitool-windows-amd64.zip
 
   linux:
     runs-on: ubuntu-latest
@@ -34,11 +42,15 @@ jobs:
         with:
           go-version: "1.27.0"
       - name: Build
-        run: CGO_ENABLED=0 go build -trimpath -o apitool-linux-amd64 .
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o apitool-linux-amd64 .
+          tar -czf apitool-linux-amd64.tar.gz apitool-linux-amd64
       - uses: actions/upload-artifact@v4
         with:
           name: apitool-linux-amd64
-          path: apitool-linux-amd64
+          path: |
+            apitool-linux-amd64
+            apitool-linux-amd64.tar.gz
 
   macos-arm:
     runs-on: macos-latest

@@ -9,3 +9,6 @@ data.json
 
 # editor
 *.log
+# the installer's embedded payload placeholder (an empty file in git,
+# replaced by the real build)
+!tools/setup/apitool.exe

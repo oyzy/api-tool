@@ -40,8 +40,9 @@ build.cmd                       # 产出 apitool.exe
 
 推送 `v*` 标签后，GitHub Actions 自动构建并发布：
 
-- `apitool-windows-amd64.exe`（GUI 子系统 + 图标）
-- `apitool-linux-amd64`
+- `apitool-windows-amd64-setup.exe`（Windows 安装器：自选目录、快捷方式、可从系统设置卸载）
+- `apitool-windows-amd64.exe` / `.zip`（免安装单文件）
+- `apitool-linux-amd64` / `.tar.gz`
 - `apitool-darwin-arm64` / `apitool-darwin-amd64`（macOS 需要 CGO，由 macOS runner 构建）
 
 手动触发：Actions 页面 → Release → Run workflow。
