@@ -711,6 +711,11 @@ func (m *model) dataDirDialog(c ui.C) {
 			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
 				ui.Text(c, "新目录").Muted()
 				ui.TextField(c, &m.dataDirNew, "新目录", "留空恢复默认位置").Grow(1)
+				if ui.Button(c, "浏览…").Small().Outline().Clicked() {
+					if dir, err := app.OpenDirectory(app.OpenDirectoryOptions{Title: "选择数据目录"}); err == nil && dir != "" {
+						c.After(func() { m.dataDirNew = dir })
+					}
+				}
 			})
 			ui.Text(c, "切换后立即从新目录读取，原目录的文件保留不动。").Muted().FontSize(12)
 		})
