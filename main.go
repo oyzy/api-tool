@@ -624,9 +624,6 @@ func (m *model) page(c ui.C) {
 				}
 				ui.Menu(c, settingsBtn, &m.settingsMenuOpen, func(menu *ui.MenuItems) {
 					menu.Label("数据目录")
-					if menu.Item("打开数据目录").Clicked() {
-						c.After(func() { _ = app.OpenPath(filepath.Dir(storeFile())) })
-					}
 					if menu.Item("更改数据目录…").Clicked() {
 						c.After(func() { m.openDataDirDialog() })
 					}
