@@ -2,7 +2,22 @@
 
 package main
 
-// auto makes RunCanvas serve the headless line protocol instead of opening a
-// window when the process starts with VIVA_HEADLESS set. It is only in tagged
-// builds, never in a release.
-import _ "github.com/vivaui/viva/headless/auto"
+// The headless build serves the line protocol instead of opening a window
+// (VIVA_HEADLESS set) — and it never touches the real store: without an
+// explicit AppData override the data file is pointed at a throwaway
+// directory, so a forgotten override cannot overwrite the user's data with
+// test runs.
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/vivaui/viva/headless/auto"
+)
+
+func init() {
+	if dataPath == "" {
+		dir := filepath.Join(os.TempDir(), "apitool-headless-store")
+		_ = os.MkdirAll(dir, 0o755)
+		dataPath = filepath.Join(dir, "data.json")
+	}
+}
