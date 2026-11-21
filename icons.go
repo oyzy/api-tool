@@ -107,3 +107,32 @@ var (
 		gfx.MoveTo(6, 11), gfx.LineTo(18, 11), gfx.LineTo(18, 21), gfx.LineTo(6, 21), gfx.ClosePath(),
 	)...)
 )
+
+// icoGithub is the octocat, compiled from Lucide's github.svg by
+// tools/genicon.
+var icoGithub = gfx.Icon{
+	ViewBox: 24.0,
+	Stroke:  2.0,
+	Cap:     gfx.CapRound,
+	Join:    gfx.JoinRound,
+	Commands: []gfx.PathCommand{
+		gfx.MoveTo(15.0, 22.0),
+		gfx.LineTo(15.0, 18.0),
+		gfx.CubicTo(15.1391, 16.7473, 14.7799, 15.4901, 14.0, 14.5),
+		gfx.CubicTo(17.0, 14.5, 20.0, 12.5, 20.0, 9.0),
+		gfx.CubicTo(20.08, 7.75, 19.73, 6.52, 19.0, 5.5),
+		gfx.CubicTo(19.28, 4.35, 19.28, 3.15, 19.0, 2.0),
+		gfx.CubicTo(19.0, 2.0, 17.03, 1.81, 14.94, 3.31),
+		gfx.CubicTo(13.96, 2.95, 12.93, 2.77, 11.9, 2.77),
+		gfx.CubicTo(10.87, 2.77, 9.84, 2.95, 8.86, 3.31),
+		gfx.CubicTo(7.77, 3.31, 5.8, 3.5, 5.8, 3.5),
+		gfx.CubicTo(5.52, 4.65, 5.52, 5.85, 5.8, 7.0),
+		gfx.CubicTo(5.07, 8.02, 4.82, 9.25, 4.8, 10.5),
+		gfx.CubicTo(4.8, 14.0, 7.8, 16.0, 10.8, 16.0),
+		gfx.CubicTo(10.41, 16.49, 10.12, 17.05, 9.95, 17.65),
+		gfx.CubicTo(9.78, 18.25, 9.73, 18.88, 9.8, 19.5),
+		gfx.LineTo(9.8, 23.5),
+		gfx.MoveTo(9.0, 18.0),
+		gfx.CubicTo(4.49, 20.0, 4.0, 16.0, 2.0, 16.0),
+	},
+}

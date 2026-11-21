@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -100,6 +101,11 @@ type model struct {
 
 	// code menu
 	// (codeOpen moved into tabState: each tab has its own menu)
+
+	// settings menu and the data-directory dialog
+	settingsMenuOpen bool
+	dataDirOpen      bool
+	dataDirNew       string
 
 	// update check
 	updateEff  *ui.EffectState[updateInfo, int]
@@ -287,16 +293,13 @@ var methodIcons = func() []gfx.Icon {
 func newModel() *model {
 	data := loadStore()
 	m := &model{
-		sidebar:       "收藏",
-		collections:   data.Collections,
-		history:       data.History,
-		envSets:       data.EnvSets,
-		activeEnvName: data.ActiveEnv,
-		splitSide:     ui.SplitterState{Pos: 240},
-		split:         ui.SplitterState{Pos: 320},
+		sidebar:   "收藏",
+		splitSide: ui.SplitterState{Pos: 240},
+		split:     ui.SplitterState{Pos: 320},
 	}
-	m.themeIdx = min(max(data.Theme, 0), len(themePresets)-1)
-	m.theme = themePresets[m.themeIdx].build()
+	if dataPath == "" { // tests may have pinned a throwaway store already
+		dataPath = loadLocationOverride() // the user's chosen directory survives restarts
+	}
 	m.runEff = ui.NewEffectKeyed[httpResult, *outgoing](func(ctx context.Context, o *outgoing) (httpResult, error) {
 		return doRequest(ctx, o)
 	}).Sequential()
@@ -306,23 +309,41 @@ func newModel() *model {
 	m.dlEff = ui.NewEffectKeyed[dlResult, string](func(ctx context.Context, _ string) (dlResult, error) {
 		return downloadAsset(ctx, m.dlInfo)
 	})
-	if len(m.envSets) == 0 {
-		m.envSets = []envSet{{Name: "默认", Vars: []kv{}}}
-	}
-	if m.activeEnvName == "" {
-		m.activeEnvName = m.envSets[0].Name
-	}
-	m.groups = data.Groups // empty folders live only here: they have no members to derive them from
-	m.collapsed = map[string]bool{}
 	m.collTree.Node = m.collNodeAt
 	m.collNodeFn, m.collLabelFn, m.collContentFn = m.collNodeAt, m.collLabelAt, m.collRowContent
 	m.jsonNodeFn, m.jsonLabelFn, m.jsonContentFn = m.jsonNodeAt, m.jsonLabelAt, m.jsonRowContent
 	m.collTree.CanDrop = m.canDropColl
 	m.histList.Header = m.histIsHeader
+	m.applyStore(data)
+	return m
+}
+
+// applyStore takes a loaded store into the model: collections, history,
+// environments, groups, the theme choice and the restored tabs. newModel calls
+// it once; 更改数据目录 calls it again after switching files.
+func (m *model) applyStore(data storeData) {
+	m.themeIdx = min(max(data.Theme, 0), len(themePresets)-1)
+	m.theme = themePresets[m.themeIdx].build()
+	m.collections = data.Collections
+	m.history = data.History
+	m.envSets = data.EnvSets
+	if len(m.envSets) == 0 {
+		m.envSets = []envSet{{Name: "默认", Vars: []kv{}}}
+	}
+	if m.envIndex(m.activeEnvName) < 0 {
+		m.activeEnvName = m.envSets[0].Name
+	}
+	m.groups = data.Groups // empty folders live only here: they have no members to derive them from
+	m.collapsed = map[string]bool{}
+	m.collQuery, m.collQuerySeen = "", ""
 	m.rebuildCollRows()
 	m.rebuildHistRows()
 	// The open tabs come back: the workspace is restored as it was left, or a
-	// single blank tab when there is nothing to restore.
+	// single blank tab when there is nothing to restore. The old tabs go
+	// first — on a store switch their in-flight requests are cancelled with
+	// them, which is what the reader asked for by moving the data away.
+	m.tabs = nil
+	m.tabSeq = 0
 	if len(data.Tabs) > 0 {
 		for _, st := range data.Tabs {
 			if st.Editing < 0 || st.Editing >= len(m.collections) {
@@ -334,7 +355,6 @@ func newModel() *model {
 	} else {
 		m.newTab() // the window opens with one blank request tab
 	}
-	return m
 }
 
 // newTab appends a fresh request tab and returns it. Its send effect is its
@@ -595,12 +615,26 @@ func (m *model) page(c ui.C) {
 				// The project's home and the update check sit before the theme
 				// menu: titlebar controls take their own clicks despite
 				// MovesWindow.
-				if ui.Button(c, "GitHub").XSmall().Ghost().Icon(icoBranch).Tooltip(repoURL + " — 打开项目主页").Clicked() {
+				if ui.Button(c, "GitHub").XSmall().Ghost().Icon(icoGithub).IconOnly().Tooltip(repoURL + " — 打开项目主页").Clicked() {
 					c.After(func() { _ = app.OpenURL(repoURL) })
 				}
-				if ui.Button(c, "检查更新").XSmall().Ghost().Tooltip("当前版本 v" + appVersion).Clicked() {
-					c.After(func() { m.updateSeq++ })
+				settingsBtn := ui.Button(c, "设置").XSmall().Ghost()
+				if settingsBtn.Clicked() {
+					m.settingsMenuOpen = true
 				}
+				ui.Menu(c, settingsBtn, &m.settingsMenuOpen, func(menu *ui.MenuItems) {
+					menu.Label("数据目录")
+					if menu.Item("打开数据目录").Clicked() {
+						c.After(func() { _ = app.OpenPath(filepath.Dir(storeFile())) })
+					}
+					if menu.Item("更改数据目录…").Clicked() {
+						c.After(func() { m.openDataDirDialog() })
+					}
+					menu.Separator()
+					if menu.Item("检查更新").Clicked() {
+						c.After(func() { m.updateSeq++ })
+					}
+				})
 				themeBtn := ui.Button(c, themePresets[m.themeIdx].name).XSmall().Ghost().Tooltip("切换主题")
 				if themeBtn.Clicked() {
 					m.themeMenuOpen = true
@@ -636,6 +670,71 @@ func (m *model) page(c ui.C) {
 	m.confirmDialog(c)
 	m.importDialog(c)
 	m.updateModal(c)
+	m.dataDirDialog(c)
+}
+
+// openDataDirDialog prefills the switch dialog with the store's directory.
+func (m *model) openDataDirDialog() {
+	m.dataDirNew = storeFile()
+	m.dataDirOpen = true
+}
+
+// switchDataDir points the store at dir and reloads everything from it. The
+// current state is checkpointed into the old location first, and the pointer
+// file makes the choice survive restarts. An empty dir restores the default.
+func (m *model) switchDataDir(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		dir = storePath() // back to the default location
+	}
+	if !strings.HasSuffix(strings.ToLower(dir), ".json") {
+		dir = filepath.Join(dir, "data.json") // the dialog asks for a directory
+	}
+	if dir == storeFile() {
+		return nil
+	}
+	m.persist() // checkpoint into the old location
+	if dir == storePath() {
+		saveLocationOverride("")
+	} else {
+		saveLocationOverride(dir)
+	}
+	dataPath = dir
+	m.applyStore(loadStore())
+	return nil
+}
+
+// dataDirDialog asks where the store should live and moves the app over.
+func (m *model) dataDirDialog(c ui.C) {
+	ui.Modal(c, &m.dataDirOpen, "数据目录", func() {
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "当前").Muted()
+				ui.Text(c, storeFile()).Mono().FontSize(12).Grow(1).Ellipsis()
+			})
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "新目录").Muted()
+				ui.TextField(c, &m.dataDirNew, "新目录", "留空恢复默认位置").Grow(1)
+			})
+			ui.Text(c, "切换后立即从新目录读取，原目录的文件保留不动。").Muted().FontSize(12)
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.dataDirOpen = false
+			}
+			if ui.Button(c, "切换并重新加载").Clicked() {
+				m.dataDirOpen = false
+				c.After(func() {
+					if err := m.switchDataDir(m.dataDirNew); err != nil {
+						m.toaster.Show("切换失败", err.Error(), ui.ToastError)
+						return
+					}
+					m.toaster.Show("数据目录已切换", storeFile(), ui.ToastSuccess)
+				})
+			}
+		})
+	})
 }
 
 // plainNotes strips the Markdown a release body is written in down to what a

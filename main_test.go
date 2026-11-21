@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,11 +25,14 @@ import (
 // the user's real data.
 func TestMain(m *testing.M) {
 	dataPath = filepath.Join(os.TempDir(), "apitool-test-data.json")
+	locationPath = filepath.Join(os.TempDir(), "apitool-test-location")
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak")
+	_ = os.Remove(locationPath)
 	code := m.Run()
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak")
+	_ = os.Remove(locationPath)
 	os.Exit(code)
 }
 
@@ -1783,6 +1787,75 @@ func TestStoreAtomicAndBackup(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak")
 	_ = os.Remove(dataPath + ".bak")
+}
+
+// TestDataDirSwitch: 更改数据目录 checkpoints the old store, points the
+// location file at the new directory, and reloads the model from whatever is
+// there; a fresh start reads the pointer file back.
+func TestDataDirSwitch(t *testing.T) {
+	dirA := t.TempDir() + string(os.PathSeparator) + "apitoolA"
+	dirB := t.TempDir() + string(os.PathSeparator) + "apitoolB"
+	seed := storeData{Collections: []savedRequest{{Name: "甲", Method: "GET", URL: "https://a.example"}}}
+	b, _ := json.MarshalIndent(seed, "", "  ")
+	if err := os.MkdirAll(dirA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirA, "data.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newModel()
+	freshTabs(m)
+	oldDataPath := dataPath
+	defer func() { dataPath = oldDataPath }()
+
+	if err := m.switchDataDir(dirA); err != nil {
+		t.Fatal(err)
+	}
+	if dataPath != filepath.Join(dirA, "data.json") {
+		t.Fatalf("dataPath = %q, want dirA/data.json", dataPath)
+	}
+	if len(m.collections) != 1 || m.collections[0].Name != "甲" {
+		t.Fatalf("collections after switch = %+v", m.collections)
+	}
+	if loadLocationOverride() != filepath.Join(dirA, "data.json") {
+		t.Fatalf("pointer = %q, want dirA/data.json", loadLocationOverride())
+	}
+
+	// switching to a fresh directory reloads an empty workspace; the old
+	// store's file is untouched
+	if err := m.switchDataDir(dirB); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.collections) != 0 || len(m.tabs) != 1 {
+		t.Fatalf("empty store: collections=%d tabs=%d", len(m.collections), len(m.tabs))
+	}
+	if loadLocationOverride() != filepath.Join(dirB, "data.json") {
+		t.Fatalf("pointer = %q, want dirB/data.json", loadLocationOverride())
+	}
+	if b2, err := os.ReadFile(filepath.Join(dirA, "data.json")); err != nil || !strings.Contains(string(b2), "甲") {
+		t.Fatalf("dirA store = %q (%v), want it untouched", b2, err)
+	}
+
+	// a fresh start honours the pointer file
+	saved := dataPath
+	dataPath = ""
+	m2 := newModel()
+	defer func() { dataPath = saved }()
+	if dataPath != filepath.Join(dirB, "data.json") {
+		t.Fatalf("dataPath from pointer = %q, want dirB/data.json", dataPath)
+	}
+	if len(m2.tabs) == 0 {
+		t.Fatal("the restarted model has no tabs")
+	}
+
+	// switching to a store's own directory is a no-op
+	if err := m2.switchDataDir(dataPath); err != nil {
+		t.Fatal(err)
+	}
+	if loadLocationOverride() != filepath.Join(dirB, "data.json") {
+		t.Fatalf("pointer changed on a no-op switch: %q", loadLocationOverride())
+	}
 }
 
 func TestMultipleEnvs(t *testing.T) {

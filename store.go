@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // envSet is one named set of environment variables.
@@ -111,9 +112,15 @@ type storeData struct {
 	Theme       int            `json:"theme"`     // the theme preset's index
 }
 
-// dataPath overrides where the data file lives; empty uses storePath(). It lets
-// tests run against a throwaway file instead of the user's real store.
+// dataPath overrides where the data file lives; empty uses the location the
+// data.location pointer names, else the default storePath(). It lets tests
+// run against a throwaway file instead of the user's real store, and carries
+// the directory the user picked in 设置.
 var dataPath string
+
+// locationPath overrides where the data.location pointer file lives; empty
+// uses the default store's directory. Tests point it at a throwaway file.
+var locationPath string
 
 // storeFile returns the data file location, honouring dataPath.
 func storeFile() string {
@@ -121,6 +128,43 @@ func storeFile() string {
 		return dataPath
 	}
 	return storePath()
+}
+
+// storeLocationFile is the pointer file beside the default store: it holds
+// the data directory the user switched to, so the choice survives restarts.
+func storeLocationFile() string {
+	if locationPath != "" {
+		return locationPath
+	}
+	return filepath.Join(filepath.Dir(storePath()), "data.location")
+}
+
+// loadLocationOverride reads the pointer file; empty means the default
+// location.
+func loadLocationOverride() string {
+	b, err := os.ReadFile(storeLocationFile())
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSpace(string(b))
+	if p == "" || p == storePath() { // the default needs no pointer
+		return ""
+	}
+	return p
+}
+
+// saveLocationOverride records the data directory (empty string removes the
+// pointer, restoring the default).
+func saveLocationOverride(dir string) {
+	p := storeLocationFile()
+	if dir == "" {
+		_ = os.Remove(p)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte(dir), 0o644)
 }
 
 // storePath returns the on-disk location of the data file.
