@@ -23,7 +23,7 @@ import (
 
 const (
 	appName    = "ApiTool"
-	appVersion = "0.1.6"
+	appVersion = "0.1.7"
 	repoURL    = "https://github.com/oyzy/api-tool"
 	repoSlug   = "oyzy/api-tool"
 )
