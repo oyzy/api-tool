@@ -42,6 +42,8 @@ type model struct {
 	// rebuilds them before the tree declares.
 	collQuerySeen string
 	histRows      []histRow // the history list's rows, a heading before each day
+	histQuery     string
+	histQuerySeen string
 
 	// collection groups: named folders in order, their members reference them
 	// by name; collRows is the flattened rows the tree shows
@@ -1909,10 +1911,19 @@ func histTime(ts string) string {
 }
 
 // rebuildHistRows flattens the history into rows, a heading before each day.
+// A non-empty history query keeps only entries whose URL, name or method
+// matches it (case-insensitive); the day headings follow the filtered rows.
 func (m *model) rebuildHistRows() {
 	m.histRows = m.histRows[:0]
+	q := strings.ToLower(strings.TrimSpace(m.histQuery))
 	label := ""
 	for i, s := range m.history {
+		if q != "" {
+			hay := strings.ToLower(s.Name + " " + s.URL + " " + s.Method)
+			if !strings.Contains(hay, q) {
+				continue
+			}
+		}
 		if d := histDay(s.Time); d != label {
 			label = d
 			m.histRows = append(m.histRows, histRow{header: true, label: d})
@@ -1926,29 +1937,45 @@ func (m *model) histIsHeader(i int) bool {
 }
 
 func (m *model) historyList(c ui.C, theme *ui.Theme) {
+	if m.histQuery != m.histQuerySeen {
+		m.histQuerySeen = m.histQuery
+		m.rebuildHistRows()
+	}
 	if len(m.history) == 0 {
 		emptyState(c, theme, icoClock, "暂无历史", "发送请求后，在这里回看每一次调用")
 		return
 	}
-	ui.Row(c).Justify(ui.End).Children(func() {
-		if ui.Button(c, "清空历史").Small().Ghost().Clicked() {
+	ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+		ui.TextField(c, &m.histQuery, "搜索", "URL、方法").Grow(1).Icon(icoSearch)
+		if ui.Button(c, "清空历史").Small().Ghost().Icon(icoTrash).IconOnly().Tooltip("清空全部历史").Clicked() {
 			m.confirmOpen = true
 		}
 	})
+	if len(m.histRows) == 0 {
+		ui.Text(c, "没有匹配“"+m.histQuery+"”的历史记录").Muted().FontSize(12)
+		return
+	}
 	ui.List(c, &m.histList, len(m.histRows), func(row ui.ListRow) {
 		h := m.histRows[row.Index]
 		if h.header {
-			row.Element.PadX(10).PadY(6).Background(theme.Muted).Children(func() {
-				ui.Text(row.C, h.label).Muted().FontSize(12)
+			row.Element.PadX(10).PadY(8).Background(theme.Muted).Children(func() {
+				ui.Text(row.C, h.label).FontSize(12).Bold()
 			})
 			return
 		}
 		s := m.history[h.idx]
 		var label ui.Box
-		row.Element.PadX(8).Gap(8).Items(ui.Center).Children(func() {
-			label = ui.Text(row.C, s.Name).Grow(1).Ellipsis().LabelFor(m.histList.RowID(row.Index))
-			ui.Text(row.C, s.Method).Mono().FontSize(11).Color(methodColor(s.Method)).Width(52)
-			ui.Text(row.C, histTime(s.Time)).Mono().FontSize(11).Muted()
+		row.Element.PadX(10).PadY(6).Children(func() {
+			// two stacked lines: the method and the clock — the two facts you
+			// scan for — over the URL, which is what tells entries apart
+			ui.Column(row.C).Gap(4).Children(func() {
+				ui.Row(row.C).Gap(8).Items(ui.Center).Children(func() {
+					ui.Text(row.C, s.Method).Mono().FontSize(11).Color(methodColor(s.Method))
+					ui.Spacer(row.C).Grow(1)
+					ui.Text(row.C, histTime(s.Time)).Mono().FontSize(11).Muted()
+				})
+				label = ui.Text(row.C, s.URL).FontSize(12).Ellipsis().LabelFor(m.histList.RowID(row.Index))
+			})
 		})
 		if !label.Valid() {
 			return
@@ -1957,6 +1984,13 @@ func (m *model) historyList(c ui.C, theme *ui.Theme) {
 			if menu.Item("打开").Icon(icoFolder).Clicked() {
 				i := h.idx
 				m.c.After(func() { m.loadHistory(i) })
+			}
+			if menu.Item("保存到收藏").Icon(icoFolder).Clicked() {
+				i := h.idx
+				m.c.After(func() {
+					m.loadHistory(i)
+					m.openSave()
+				})
 			}
 			menu.Separator()
 			if menu.Item("删除").Icon(icoTrash).Destructive().Clicked() {

@@ -2081,6 +2081,41 @@ func TestCloseTabGuard(t *testing.T) {
 	_ = os.Remove(dataPath + ".bak")
 }
 
+// TestHistorySearch: rebuildHistRows honours the query, keeping entries whose
+// URL, name or method matches, with the day headings following the survivors.
+func TestHistorySearch(t *testing.T) {
+	m := newModel()
+	m.history = []savedRequest{
+		{Name: "GET http://a.example/first", Method: "GET", URL: "http://a.example/first", Time: time.Now().Format("2006-01-02 15:04:05")},
+		{Name: "POST http://b.example/second", Method: "POST", URL: "http://b.example/second", Time: time.Now().Format("2006-01-02 15:04:06")},
+	}
+	m.rebuildHistRows()
+	if len(m.histRows) != 3 {
+		t.Fatalf("rows = %d, want header + 2 entries", len(m.histRows))
+	}
+
+	m.histQuery = "second"
+	m.rebuildHistRows()
+	if len(m.histRows) != 2 {
+		t.Fatalf("filtered rows = %d, want header + 1 entry", len(m.histRows))
+	}
+	if m.histRows[1].idx != 1 {
+		t.Fatalf("kept idx = %d, want the second entry", m.histRows[1].idx)
+	}
+
+	m.histQuery = "get http"
+	m.rebuildHistRows() // case-insensitive, matches the method too
+	if len(m.histRows) != 2 || m.histRows[1].idx != 0 {
+		t.Fatalf("method search: rows = %+v", m.histRows)
+	}
+
+	m.histQuery = "nomatch"
+	m.rebuildHistRows()
+	if len(m.histRows) != 0 {
+		t.Fatalf("no-match rows = %d, want 0", len(m.histRows))
+	}
+}
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets
