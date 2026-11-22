@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +47,7 @@ type updateInfo struct {
 	assetName string
 	assetURL  string
 	size      int64
+	sha256    string // the asset's expected hash, from the release's checksums.txt
 	upToDate  bool
 	err       string
 }
@@ -159,6 +162,20 @@ func fetchUpdate(ctx context.Context) (updateInfo, error) {
 	if asset, ok := pickAsset(rel.Assets, runtime.GOOS, runtime.GOARCH); ok {
 		info.assetName, info.assetURL, info.size = asset.Name, asset.BrowserDownloadURL, asset.Size
 	}
+	// the release ships a checksums.txt: carry the expected hash for this
+	// platform's asset so the download can be verified (a missing or
+	// unreadable checksum is not fatal — the update still goes through)
+	if info.assetName != "" {
+		for _, a := range rel.Assets {
+			if a.Name != "checksums.txt" {
+				continue
+			}
+			if raw, err := httpGet(ctx, client, a.BrowserDownloadURL); err == nil {
+				info.sha256 = checksumFor(string(raw), info.assetName)
+			}
+			break
+		}
+	}
 	info.available = semverLess(appVersion, rel.TagName)
 	info.upToDate = !info.available
 	return info, nil
@@ -189,7 +206,27 @@ func downloadUpdate(ctx context.Context, info updateInfo) ([]byte, error) {
 	if info.size > 0 && int64(len(body)) != info.size {
 		return nil, fmt.Errorf("下载不完整: %d/%d 字节", len(body), info.size)
 	}
+	if info.sha256 != "" {
+		sum := sha256.Sum256(body)
+		if hex.EncodeToString(sum[:]) != info.sha256 {
+			return nil, fmt.Errorf("校验和不匹配，下载可能损坏，已中止")
+		}
+	}
 	return body, nil
+}
+
+// checksumFor picks one file's hash out of a sha256sum-style checksum listing.
+func checksumFor(list, name string) string {
+	for _, line := range strings.Split(list, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			file := strings.TrimPrefix(strings.TrimPrefix(fields[1], "*"), "./")
+			if file == name {
+				return strings.ToLower(fields[0])
+			}
+		}
+	}
+	return ""
 }
 
 // applyUpdate swaps the downloaded exe over the running one: a running exe on

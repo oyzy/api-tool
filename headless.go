@@ -10,13 +10,15 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 
 	_ "github.com/vivaui/viva/headless/auto"
 )
 
 func init() {
 	if dataPath == "" {
-		dir := filepath.Join(os.TempDir(), "apitool-headless-store")
+		// per-process: two headless runs never see each other's tabs
+		dir := filepath.Join(os.TempDir(), "apitool-headless-store-"+strconv.Itoa(os.Getpid()))
 		_ = os.MkdirAll(dir, 0o755)
 		dataPath = filepath.Join(dir, "data.json")
 	}

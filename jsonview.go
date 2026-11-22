@@ -15,7 +15,8 @@ import (
 // reads strings — nothing formats per frame.
 type jsonNode struct {
 	depth    int
-	branch   bool // an object or array with at least one member
+	key      string // the raw key or array index ("" for the root)
+	branch   bool   // an object or array with at least one member
 	open     bool
 	keyText  string // `"name": ` or `0: ` or ``
 	openText string // `{` or `[`, shown while expanded
@@ -47,7 +48,7 @@ func parseJSONTree(body string) *jsonNode {
 // buildJSONNode builds one node and its children. For an array member, key is
 // the element's index and indexed is true.
 func buildJSONNode(key string, v any, depth int, indexed bool) jsonNode {
-	n := jsonNode{depth: depth}
+	n := jsonNode{depth: depth, key: key}
 	switch {
 	case indexed:
 		n.keyText = key + ": "
@@ -84,6 +85,81 @@ func buildJSONNode(key string, v any, depth int, indexed bool) jsonNode {
 		n.valText, n.valKind = jsonValueText(v)
 	}
 	return n
+}
+
+// jsonPathOf walks the tree for the node at visible row i and returns its
+// dotted path (data.items[0].id) with the leaf's own name. ok=false for the
+// root or a row the tree no longer has.
+func (t *tabState) jsonPathOf(i int) (path string, leaf string, ok bool) {
+	if i < 0 || i >= len(t.jsonRows) || t.jsonRoot == nil {
+		return "", "", false
+	}
+	target := t.jsonRows[i]
+	var walk func(n *jsonNode, prefix string) (string, bool)
+	walk = func(n *jsonNode, prefix string) (string, bool) {
+		if n == target {
+			return prefix, true
+		}
+		for ci := range n.children {
+			c := &n.children[ci]
+			child := c.key
+			if prefix != "" {
+				if n.openText == "[" {
+					child = prefix + "[" + c.key + "]"
+				} else {
+					child = prefix + "." + c.key
+				}
+			}
+			if p, hit := walk(c, child); hit {
+				return p, true
+			}
+		}
+		return "", false
+	}
+	path, ok = walk(t.jsonRoot, "")
+	if !ok {
+		return "", "", false
+	}
+	leaf = path
+	if i := strings.LastIndexByte(leaf, '.'); i >= 0 {
+		leaf = leaf[i+1:]
+	}
+	if i := strings.LastIndexByte(leaf, '['); i >= 0 {
+		leaf = leaf[i+1:]
+	}
+	leaf = strings.TrimSuffix(leaf, "]")
+	return path, leaf, true
+}
+
+// jsonRawValue is a scalar node's value the way a variable wants it: strings
+// unquoted, everything else as its text.
+func (n *jsonNode) jsonRawValue() string {
+	if n.valKind == 's' {
+		if un, err := strconv.Unquote(n.valText); err == nil {
+			return un
+		}
+	}
+	return n.valText
+}
+
+// varNameFor derives a variable's name from the node's JSON path: the leaf's
+// own name, or the path joined with _ when the leaf is an array index.
+func varNameFor(path, leaf string) string {
+	if leaf == "" {
+		return strings.NewReplacer(".", "_", "[", "_", "]", "").Replace(path)
+	}
+	if _, err := strconv.Atoi(leaf); err == nil { // an array index
+		trimmed := strings.TrimSuffix(path, "["+leaf+"]")
+		trimmed = strings.TrimSuffix(trimmed, "."+leaf)
+		parent := leaf
+		if i := strings.LastIndexAny(trimmed, ".[]"); i >= 0 {
+			parent = trimmed[i+1:]
+		} else {
+			parent = trimmed
+		}
+		return parent + "_" + leaf
+	}
+	return leaf
 }
 
 // jsonValueText renders a scalar and says what it is, for its color.
@@ -192,11 +268,22 @@ func (m *model) jsonRowContent(i int) {
 	case 'e':
 		color = theme.MutedForeground
 	}
+	var valBox ui.Box
 	ui.Row(m.c).Gap(0).Children(func() {
 		if n.keyText != "" {
 			// Shrink(0): a long value must squeeze itself (Ellipsis), not the key
 			ui.Text(m.c, n.keyText).Mono().FontSize(13).Shrink(0)
 		}
-		ui.Text(m.c, val).Mono().FontSize(13).Color(color).Grow(1).Ellipsis()
+		valBox = ui.Text(m.c, val).Mono().FontSize(13).Color(color).Grow(1).Ellipsis().LabelFor(m.t().jsonTree.RowID(i))
 	})
+	// A scalar's value can become an environment variable: right-click it and
+	// the dialog prefills the variable's name from the node's JSON path.
+	if valBox.Valid() && !n.branch && val != "" {
+		row := i
+		ui.ContextMenu(m.c, valBox, func(menu *ui.MenuItems) {
+			if menu.Item("存为变量…").Clicked() {
+				m.c.After(func() { m.openVarDialog(row) })
+			}
+		})
+	}
 }

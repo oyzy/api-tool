@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1892,6 +1894,104 @@ func TestUpdateApply(t *testing.T) {
 	}
 	_ = os.Remove(exe)
 	_ = os.Remove(exe + ".old")
+}
+
+// TestVarNameFor: a leaf becomes the variable's name; an array index joins
+// its parent with an underscore.
+func TestVarNameFor(t *testing.T) {
+	if got := varNameFor("data.token", "token"); got != "token" {
+		t.Fatalf("name = %q, want token", got)
+	}
+	if got := varNameFor("tags[1]", "1"); got != "tags_1" {
+		t.Fatalf("name = %q, want tags_1", got)
+	}
+	if got := varNameFor("data.0.id", "id"); got != "id" {
+		t.Fatalf("name = %q, want id", got)
+	}
+	if got := varNameFor("data", ""); got != "data" {
+		t.Fatalf("name = %q, want data", got)
+	}
+}
+
+// TestSaveEnvVar: writing an unknown name appends, a known name updates in
+// place, and an empty name is rejected.
+func TestSaveEnvVar(t *testing.T) {
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+	m := newModel()
+	m.envSets = []envSet{{Name: "测试", Vars: []kv{{Key: "old", Value: "1"}}}}
+	m.activeEnvName = "测试"
+
+	m.saveEnvVar("token", "abc")
+	m.saveEnvVar("token", "def") // update in place
+	m.saveEnvVar("host", "example.com")
+	if m.envSets[0].Vars[0].Key != "old" || m.envSets[0].Vars[0].Value != "1" {
+		t.Fatalf("vars[0] = %+v, want old=1 untouched", m.envSets[0].Vars[0])
+	}
+	if len(m.envSets[0].Vars) != 3 {
+		t.Fatalf("vars = %+v, want old + token + host", m.envSets[0].Vars)
+	}
+	if v := m.envSets[0].Vars[1]; v.Key != "token" || v.Value != "def" {
+		t.Fatalf("token var = %+v, want updated to def", v)
+	}
+	m.saveEnvVar("  ", "x")
+	if len(m.envSets[0].Vars) != 3 {
+		t.Fatalf("an empty name must be rejected")
+	}
+	// persisted
+	m2 := newModel()
+	if len(m2.envSets[0].Vars) != 3 || m2.envSets[0].Vars[1].Value != "def" {
+		t.Fatalf("vars after restart = %+v", m2.envSets[0].Vars)
+	}
+}
+
+// TestUpdateChecksum: the check carries the platform asset's expected hash
+// from the release's checksums.txt, and the download verifies it.
+func TestUpdateChecksum(t *testing.T) {
+	old := updateAPIBase
+	defer func() { updateAPIBase = old }()
+
+	payload := []byte("new-exe-bytes")
+	sum := sha256.Sum256(payload)
+	hash := hex.EncodeToString(sum[:])
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/" + repoSlug + "/releases/latest":
+			fmt.Fprintf(w, `{"tag_name":"v9.9.9","assets":[`+
+				`{"name":"apitool-windows-amd64.exe","size":%d,"browser_download_url":"%s/bin"},`+
+				`{"name":"checksums.txt","size":99,"browser_download_url":"%s/sums"}]}`, len(payload), srv.URL, srv.URL)
+		case "/bin":
+			w.Write(payload)
+		case "/sums":
+			fmt.Fprintf(w, "%s  apitool-windows-amd64.exe\n%s  other-file", hash, strings.Repeat("0", 64))
+		}
+	}))
+	defer srv.Close()
+	updateAPIBase = srv.URL
+
+	info, err := fetchUpdate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.sha256 != hash {
+		t.Fatalf("sha256 = %q, want %q", info.sha256, hash)
+	}
+
+	// the honest download passes; a tampered one is rejected
+	got, err := downloadUpdate(context.Background(), info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new-exe-bytes" {
+		t.Fatalf("downloaded = %q", got)
+	}
+	bad := info
+	bad.sha256 = strings.Repeat("0", 64)
+	if _, err := downloadUpdate(context.Background(), bad); err == nil {
+		t.Fatal("a checksum mismatch must abort the download")
+	}
 }
 
 func TestMultipleEnvs(t *testing.T) {

@@ -107,6 +107,11 @@ type model struct {
 	dataDirOpen      bool
 	dataDirNew       string
 
+	// save-response-value-as-variable dialog
+	varOpen  bool
+	varName  string
+	varValue string
+
 	// update check
 	updateEff   *ui.EffectState[updateInfo, int]
 	updateSeq   int
@@ -516,6 +521,10 @@ func config() app.Config {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-uninstall" {
+		runUninstall()
+		return
+	}
 	m := newModel()
 	page := ui.NewPage(ui.PageConfig{View: m.page, Theme: &m.theme})
 	cfg := page.Config(config())
@@ -671,6 +680,75 @@ func (m *model) page(c ui.C) {
 	m.importDialog(c)
 	m.updateModal(c)
 	m.dataDirDialog(c)
+	m.varDialog(c)
+}
+
+// openVarDialog prefills the save-as-variable dialog from a response JSON
+// row: the name comes from the node's path, the value from the node itself.
+func (m *model) openVarDialog(row int) {
+	path, leaf, ok := m.t().jsonPathOf(row)
+	if !ok {
+		return
+	}
+	m.varName = varNameFor(path, leaf)
+	m.varValue = m.t().jsonRows[row].jsonRawValue()
+	m.varOpen = true
+}
+
+// saveEnvVar writes a variable into the active environment set, updating in
+// place when the name already exists.
+func (m *model) saveEnvVar(name, value string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		m.toaster.Show("变量名不能为空", "给变量起个名字再保存", ui.ToastError)
+		return
+	}
+	idx := m.activeEnvIndex()
+	for i := range m.envSets[idx].Vars {
+		if m.envSets[idx].Vars[i].Key == name {
+			m.envSets[idx].Vars[i].Value = value
+			m.persist()
+			m.toaster.Show("变量已更新", "{{"+name+"}}（环境 "+m.activeEnvName+"）", ui.ToastSuccess)
+			return
+		}
+	}
+	m.envSets[idx].Vars = append(m.envSets[idx].Vars, kv{Key: name, Value: value})
+	m.persist()
+	m.toaster.Show("已存入环境 "+m.activeEnvName, "{{"+name+"}} 可在任意请求里引用", ui.ToastSuccess)
+}
+
+// varDialog shows the picked response value and the variable name it will be
+// saved under in the active environment.
+func (m *model) varDialog(c ui.C) {
+	ui.Modal(c, &m.varOpen, "存为环境变量", func() {
+		theme := c.Theme()
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "值").Muted()
+				ui.Text(c, m.varValue).Mono().Grow(1).Ellipsis()
+			})
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "变量名").Muted()
+				ui.TextField(c, &m.varName, "变量名", "token").Grow(1)
+			})
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "存入环境").Muted()
+				ui.Text(c, m.activeEnvName).Bold()
+				ui.Text(c, "引用：{{"+m.varName+"}}").Muted().Mono().FontSize(12).Grow(1).Ellipsis()
+			})
+			_ = theme
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.varOpen = false
+			}
+			if ui.Button(c, "保存").Clicked() {
+				m.varOpen = false
+				c.After(func() { m.saveEnvVar(m.varName, m.varValue) })
+			}
+		})
+	})
 }
 
 // openDataDirDialog opens the switch dialog with nothing chosen yet: the

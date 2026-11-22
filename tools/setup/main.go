@@ -55,10 +55,6 @@ type model struct {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "-uninstall" {
-		runUninstall()
-		return
-	}
 	m := &model{desktop: true, startMenu: true, runAfter: true, theme: ui.LightTheme()}
 	page := ui.NewPage(ui.PageConfig{View: m.page, Theme: &m.theme})
 	cfg := page.Config(app.Config{
@@ -201,12 +197,6 @@ func installTo(dir string, desktop, startMenu bool) error {
 		}
 		_ = os.Remove(tmp)
 	}
-	self, err := os.Executable()
-	if err == nil {
-		if b, err := os.ReadFile(self); err == nil {
-			_ = os.WriteFile(filepath.Join(dir, "uninstall.exe"), b, 0o644)
-		}
-	}
 	if headless() {
 		return nil // tests: no registry or shortcut writes
 	}
@@ -226,35 +216,11 @@ func installTo(dir string, desktop, startMenu bool) error {
 		{"Publisher", "oyzy"},
 		{"InstallLocation", dir},
 		{"DisplayIcon", iconSource(dir, icoOK, icoPath)},
-		{"UninstallString", `"` + filepath.Join(dir, "uninstall.exe") + `" -uninstall`},
+		{"UninstallString", `"` + filepath.Join(dir, "apitool.exe") + `" -uninstall`},
 	} {
 		_ = exec.Command("reg", "add", uninstallKey, "/v", v[0], "/t", "REG_SZ", "/d", v[1], "/f").Run()
 	}
 	return nil
-}
-
-// uninstall removes what installTo laid down: registry, shortcuts, and the
-// install directory. The running uninstaller itself sits in that directory,
-// so the final rmdir runs detached after this process is gone.
-func runUninstall() {
-	out, _ := exec.Command("reg", "query", uninstallKey, "/v", "InstallLocation").Output()
-	dir := ""
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, "InstallLocation") {
-			continue
-		}
-		if parts := strings.Fields(line); len(parts) >= 3 {
-			dir = parts[len(parts)-1]
-		}
-	}
-	if dir == "" {
-		return
-	}
-	_ = exec.Command("reg", "delete", uninstallKey, "/f").Run()
-	_ = os.Remove(filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "ApiTool.lnk"))
-	_ = os.Remove(filepath.Join(desktopFolder(), "ApiTool.lnk"))
-	// the classic dance: this exe lives in the directory being removed
-	_ = exec.Command("cmd", "/c", "timeout /t 2 /nobreak >nul & rmdir /s /q \""+dir+"\"").Start()
 }
 
 // makeShortcut lays a .lnk via the shell COM object PowerShell exposes.
