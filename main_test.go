@@ -283,7 +283,7 @@ func TestAuthHelpers(t *testing.T) {
 	}
 
 	// the collection runner synthesizes the same headers
-	o = toOutgoing(s, true, nil)
+	o = m.toOutgoing(s, true, nil)
 	if o.Headers[0].Key != "Authorization" || !strings.HasPrefix(o.Headers[0].Value, "Basic ") {
 		t.Fatalf("runner headers = %+v, want the Basic header first", o.Headers)
 	}
@@ -2113,6 +2113,82 @@ func TestHistorySearch(t *testing.T) {
 	m.rebuildHistRows()
 	if len(m.histRows) != 0 {
 		t.Fatalf("no-match rows = %d, want 0", len(m.histRows))
+	}
+}
+
+// TestHistoryStatus: a send creates a history entry with an id; the landing
+// response writes its status into that entry, surviving newer sends and
+// deletions of unrelated entries.
+func TestHistoryStatus(t *testing.T) {
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer srv.Close()
+
+	m := newModel()
+	freshTabs(m)
+	m.t().url = srv.URL
+	m.send()
+	if m.t().histID == 0 || m.history[0].ID != m.t().histID {
+		t.Fatalf("histID = %d, entry ID = %d", m.t().histID, m.history[0].ID)
+	}
+	firstID := m.history[0].ID
+
+	// the response lands: the entry carries the status
+	m.applyResult(0, httpResult{Status: 418}, nil)
+	if m.history[0].Status != 418 {
+		t.Fatalf("history status = %d, want 418", m.history[0].Status)
+	}
+
+	// a second send from the same tab gets its own entry
+	m.send()
+	if m.history[0].ID == firstID {
+		t.Fatal("the second send must create a new entry")
+	}
+	m.applyResult(0, httpResult{Status: 418}, nil)
+	if m.history[0].Status != 418 || m.history[1].Status != 418 {
+		t.Fatalf("statuses = %d/%d, want both 418", m.history[0].Status, m.history[1].Status)
+	}
+
+	// deleting the newest entry keeps the older one's id lookup honest
+	m.deleteHistoryEntry(0)
+	if m.history[0].ID != firstID || m.history[0].Status != 418 {
+		t.Fatalf("older entry disturbed: %+v", m.history[0])
+	}
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+}
+
+// TestRespHistorySwitch: two sends keep both responses; the switcher rebuilds
+// the views for whichever is selected.
+func TestRespHistorySwitch(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+	m.applyResult(0, httpResult{Status: 200, Body: `{"n":1}`, Elapsed: 10 * time.Millisecond}, nil)
+	m.applyResult(0, httpResult{Status: 200, Body: `{"n":2}`, Elapsed: 20 * time.Millisecond}, nil)
+	if len(m.t().respHistory) != 2 || m.t().respHistIdx != 1 {
+		t.Fatalf("history = %d idx = %d, want 2/1", len(m.t().respHistory), m.t().respHistIdx)
+	}
+	if m.t().resp.Body != `{"n":2}` {
+		t.Fatalf("visible body = %q, want the latest", m.t().resp.Body)
+	}
+
+	m.t().showRespHistory(0)
+	if m.t().resp.Body != `{"n":1}` || m.t().respHistIdx != 0 {
+		t.Fatalf("after switch: body = %q idx = %d", m.t().resp.Body, m.t().respHistIdx)
+	}
+	if m.t().jsonRoot == nil || m.t().jsonRoot.children[0].valText != `1` {
+		t.Fatalf("the tree was not rebuilt for the older response")
+	}
+	if m.t().respMeta == "" {
+		t.Fatal("respMeta was not rebuilt")
+	}
+
+	m.t().showRespHistory(1)
+	if m.t().resp.Body != `{"n":2}` {
+		t.Fatal("switching back to the latest failed")
 	}
 }
 

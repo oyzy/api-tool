@@ -28,11 +28,13 @@ type authConfig struct {
 // savedRequest is one saved collection item or one history entry. Group names
 // the folder it sits in; empty is the implicit 未分组.
 type savedRequest struct {
-	Name       string
-	Group      string
-	Time       string
-	Method     string
-	URL        string
+	ID     int64 // unique id for in-place updates (e.g. the status lands after the entry is created)
+	Name   string
+	Group  string
+	Time   string
+	Status int // the response's HTTP status; 0 while the request is in flight
+	Method string
+	URL    string
 	Params     []kv
 	Headers    []kv
 	BodyType   string
@@ -109,7 +111,8 @@ type storeData struct {
 	ActiveEnv   string         `json:"activeEnv"`
 	Tabs        []savedTab     `json:"tabs"`      // the open request tabs
 	ActiveTab   int            `json:"activeTab"` // which one was on screen
-	Theme       int            `json:"theme"`     // the theme preset's index
+	Theme       int            `json:"theme"`      // the theme preset's index
+	TimeoutSec  int            `json:"timeoutSec"` // request timeout in seconds; 0 = 30
 }
 
 // dataPath overrides where the data file lives; empty uses the location the

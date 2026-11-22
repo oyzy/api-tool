@@ -55,6 +55,7 @@ type outgoing struct {
 	FormFields      []formField
 	Envs            []kv
 	FollowRedirects bool
+	TimeoutSec      int // 0 means the default 30s
 }
 
 // httpResult is what the worker returns to the page.
@@ -240,7 +241,11 @@ func doRequest(ctx context.Context, o *outgoing) (httpResult, error) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	timeout := 30 * time.Second
+	if o.TimeoutSec > 0 {
+		timeout = time.Duration(o.TimeoutSec) * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
 	if !o.FollowRedirects {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -254,7 +259,7 @@ func doRequest(ctx context.Context, o *outgoing) (httpResult, error) {
 		// update checker uses
 		if up := systemProxyURL(); up != nil {
 			viaProxy := &http.Client{
-				Timeout:   30 * time.Second,
+				Timeout:   timeout,
 				Transport: &http.Transport{Proxy: http.ProxyURL(up)},
 			}
 			if !o.FollowRedirects {

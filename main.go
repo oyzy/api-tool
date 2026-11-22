@@ -118,6 +118,16 @@ type model struct {
 	closeTabOpen bool
 	pendingClose int // the tab's id awaiting confirmation
 
+	// request settings dialog (the live value lives in the store as TimeoutSec)
+	reqSettingsOpen bool
+	timeoutText     string
+	timeoutSec      int
+
+	// history ids: entries are updated in place (the response's status lands
+	// after the entry exists), identified by id so deletions and new sends
+	// cannot misplace them
+	historySeq int64
+
 	// save-response-value-as-variable dialog
 	varOpen  bool
 	varName  string
@@ -206,6 +216,7 @@ type tabState struct {
 	// editing is the index of the collection entry this tab holds, -1 when it
 	// is a fresh request (a save then appends)
 	editing int
+	histID  int64 // the history entry this tab's send created (0 = none)
 
 	// the response
 	resp      *httpResult
@@ -221,6 +232,10 @@ type tabState struct {
 	jsonRows []*jsonNode
 	jsonTree ui.TreeState
 	respView string // "树" | "文本"
+
+	// the last few responses of this tab, for comparing runs
+	respHistory []httpResult
+	respHistIdx int // which one is on screen (len-1 = newest)
 
 	codeOpen bool
 }
@@ -343,6 +358,13 @@ func (m *model) applyStore(data storeData) {
 	m.theme = themePresets[m.themeIdx].build()
 	m.collections = data.Collections
 	m.history = data.History
+	m.timeoutSec = max(data.TimeoutSec, 0)
+	m.timeoutText = strconv.Itoa(m.timeoutSec)
+	for _, s := range m.history { // ids keep growing across restarts
+		if s.ID > m.historySeq {
+			m.historySeq = s.ID
+		}
+	}
 	m.envSets = data.EnvSets
 	if len(m.envSets) == 0 {
 		m.envSets = []envSet{{Name: "默认", Vars: []kv{}}}
@@ -739,6 +761,9 @@ func (m *model) page(c ui.C) {
 					if menu.Item("更改数据目录…").Clicked() {
 						c.After(func() { m.openDataDirDialog() })
 					}
+					if menu.Item("请求设置…").Clicked() {
+						c.After(func() { m.reqSettingsOpen = true })
+					}
 					menu.Separator()
 					if menu.Item("检查更新").Clicked() {
 						c.After(func() { m.updateSeq++ })
@@ -787,6 +812,49 @@ func (m *model) page(c ui.C) {
 	m.aboutDialog(c)
 	m.deleteCollDialog(c)
 	m.closeTabDialog(c)
+	m.reqSettingsDialog(c)
+}
+
+// reqSettingsDialog edits the request-wide settings: the timeout every send
+// uses (the store keeps the live value; the field is the editing copy).
+func (m *model) reqSettingsDialog(c ui.C) {
+	ui.Modal(c, &m.reqSettingsOpen, "请求设置", func() {
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "超时（秒）").Muted()
+				ui.TextField(c, &m.timeoutText, "超时秒数", "30").Width(120)
+			})
+			ui.Text(c, "应用于所有请求；留空或 0 恢复默认 30 秒。").Muted().FontSize(12)
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.reqSettingsOpen = false
+			}
+			if ui.Button(c, "保存").Clicked() {
+				m.reqSettingsOpen = false
+				c.After(func() {
+					n := 0
+					if v := strings.TrimSpace(m.timeoutText); v != "" {
+						parsed, err := strconv.Atoi(v)
+						if err != nil || parsed <= 0 {
+							m.toaster.Show("无效的超时", "请输入正整数秒数", ui.ToastError)
+							return
+						}
+						n = parsed
+					}
+					m.timeoutSec = n
+					m.timeoutText = strconv.Itoa(n)
+					m.persist()
+					if n > 0 {
+						m.toaster.Show("请求设置已保存", "超时 "+strconv.Itoa(n)+" 秒", ui.ToastSuccess)
+					} else {
+						m.toaster.Show("请求设置已保存", "超时恢复默认 30 秒", ui.ToastSuccess)
+					}
+				})
+			}
+		})
+	})
 }
 
 // openVarDialog prefills the save-as-variable dialog from a response JSON
@@ -1581,7 +1649,7 @@ func (m *model) requestMenuItems(menu *ui.MenuItems, coll int) {
 			lang := lang
 			if to.Item(langLabel(lang)).Clicked() {
 				m.c.After(func() {
-					code := generateCode(lang, toOutgoing(m.collections[coll], m.t().followRedirects, m.activeEnvs()), m.t().followRedirects)
+					code := generateCode(lang, m.toOutgoing(m.collections[coll], m.t().followRedirects, m.activeEnvs()), m.t().followRedirects)
 					if err := app.SetClipboardText(code); err != nil {
 						m.toaster.Show("复制失败", err.Error(), ui.ToastError)
 						return
@@ -1971,6 +2039,9 @@ func (m *model) historyList(c ui.C, theme *ui.Theme) {
 			ui.Column(row.C).Gap(4).Children(func() {
 				ui.Row(row.C).Gap(8).Items(ui.Center).Children(func() {
 					ui.Text(row.C, s.Method).Mono().FontSize(11).Color(methodColor(s.Method))
+					if s.Status > 0 {
+						ui.Text(row.C, strconv.Itoa(s.Status)).Mono().FontSize(11).Color(statusCodeColor(s.Status, theme))
+					}
 					ui.Spacer(row.C).Grow(1)
 					ui.Text(row.C, histTime(s.Time)).Mono().FontSize(11).Muted()
 				})
@@ -2956,21 +3027,27 @@ func (m *model) runResultsPanel(c ui.C, theme *ui.Theme) {
 	})
 }
 
-func (m *model) statusBadge(c ui.C, theme *ui.Theme) {
-	code := m.t().resp.Status
-	color := theme.MutedForeground
+// statusCodeColor is the colour a response status wears: green for 2xx, blue
+// for 3xx, the app's orange for 4xx and red for 5xx.
+func statusCodeColor(code int, theme *ui.Theme) gfx.Color {
 	switch {
 	case code >= 200 && code < 300:
-		color = theme.Success
+		return theme.Success
 	case code >= 300 && code < 400:
-		color = theme.Primary
+		return theme.Primary
 	case code >= 400 && code < 500:
 		// Accent is a surface colour, nearly invisible as text on light — the
 		// same lesson the JSON tree's bools taught: 4xx gets the app's orange.
-		color = methodColor("POST")
+		return methodColor("POST")
 	case code >= 500:
-		color = theme.Danger
+		return theme.Danger
 	}
+	return theme.MutedForeground
+}
+
+func (m *model) statusBadge(c ui.C, theme *ui.Theme) {
+	code := m.t().resp.Status
+	color := statusCodeColor(code, theme)
 	ui.Row(c).PadX(8).Height(22).Radius(theme.Metrics.RadiusControl).Background(color.WithAlpha(0.15)).Center().Children(func() {
 		ui.Text(c, strconv.Itoa(code)).Bold().Color(color)
 	})
@@ -2998,6 +3075,20 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 			}
 		})
 		return
+	}
+	// the tab keeps its last few responses: flip through them to compare runs
+	if len(m.t().respHistory) > 1 {
+		ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+			if ui.Button(c, "‹ 上一条").Small().Ghost().Disabled(m.t().respHistIdx <= 0).Clicked() {
+				c.After(func() { m.t().showRespHistory(m.t().respHistIdx - 1) })
+			}
+			ui.Text(c, fmt.Sprintf("响应 %d/%d", m.t().respHistIdx+1, len(m.t().respHistory))).Mono().FontSize(12)
+			if ui.Button(c, "下一条 ›").Small().Ghost().Disabled(m.t().respHistIdx >= len(m.t().respHistory)-1).Clicked() {
+				c.After(func() { m.t().showRespHistory(m.t().respHistIdx + 1) })
+			}
+			ui.Spacer(c).Grow(1)
+			ui.Text(c, m.t().respHistory[m.t().respHistIdx].StatusText).Muted().FontSize(12)
+		})
 	}
 	if m.t().jsonRoot != nil {
 		ui.Row(c).Justify(ui.End).Items(ui.Center).Children(func() {
@@ -3124,6 +3215,7 @@ func (m *model) buildOutgoing() *outgoing {
 		FormFields:      append([]formField(nil), m.t().formFields...),
 		Envs:            envs,
 		FollowRedirects: m.t().followRedirects,
+		TimeoutSec:      m.timeoutSec,
 	}
 }
 
@@ -3138,9 +3230,12 @@ func (m *model) send() {
 	m.t().respLines = nil
 	m.t().respMeta = ""
 
+	m.historySeq++
 	entry := m.t().toSaved(m.t().method + " " + m.t().url)
+	entry.ID = m.historySeq
 	entry.Time = time.Now().Format("2006-01-02 15:04:05")
 	m.history = append([]savedRequest{entry}, m.history...)
+	m.t().histID = entry.ID
 	if len(m.history) > 200 {
 		m.history = m.history[:200]
 	}
@@ -3174,13 +3269,51 @@ func (m *model) applyResult(i int, r httpResult, err error) {
 	// the JSON tree is the expensive view: past a size cap the response falls
 	// back to the text view, and the text view itself shows a bounded number
 	// of lines (复制响应体 always carries the full body).
+	// the response's status lands in the history entry this tab created
+	if t.histID != 0 {
+		for hi := range m.history {
+			if m.history[hi].ID == t.histID {
+				m.history[hi].Status = r.Status
+				m.rebuildHistRows()
+				m.persist()
+				break
+			}
+		}
+	}
+	// keep the last few responses around for comparing runs
+	t.respHistory = append(t.respHistory, r)
+	if len(t.respHistory) > 5 {
+		t.respHistory = t.respHistory[len(t.respHistory)-5:]
+	}
+	t.respHistIdx = len(t.respHistory) - 1
+	t.resp = &t.respHistory[t.respHistIdx]
+
 	if len(r.Body) <= maxTreeBytes {
 		t.jsonRoot = parseJSONTree(r.Body)
 	} else {
 		t.jsonRoot = nil
 	}
 	t.rebuildJSONRows()
+	t.respLines = cappedLines(r.Body, maxTextLines)
 	t.assertResults = runAssertions(t.assertions, m.activeEnvs(), &r)
+}
+
+// showRespHistory switches the tab's response area to one of its past
+// responses, rebuilding the derived views (tree, lines, meta) for it.
+func (t *tabState) showRespHistory(idx int) {
+	if idx < 0 || idx >= len(t.respHistory) || idx == t.respHistIdx {
+		return
+	}
+	t.respHistIdx = idx
+	t.resp = &t.respHistory[idx]
+	if len(t.respHistory[idx].Body) <= maxTreeBytes {
+		t.jsonRoot = parseJSONTree(t.respHistory[idx].Body)
+	} else {
+		t.jsonRoot = nil
+	}
+	t.rebuildJSONRows()
+	t.respLines = cappedLines(t.respHistory[idx].Body, maxTextLines)
+	t.respMeta = fmt.Sprintf("%d ms · %s", t.respHistory[idx].Elapsed.Milliseconds(), formatSize(t.respHistory[idx].Size))
 }
 
 const (
@@ -3226,7 +3359,7 @@ func (m *model) setNextRun() {
 		return
 	}
 	idx := m.runQueue[m.runIndex]
-	m.runKey = toOutgoing(m.collections[idx], m.t().followRedirects, m.activeEnvs())
+	m.runKey = m.toOutgoing(m.collections[idx], m.t().followRedirects, m.activeEnvs())
 }
 
 func (m *model) advanceRun(r httpResult, err error) {
@@ -3262,7 +3395,7 @@ func (m *model) advanceRun(r httpResult, err error) {
 	m.invalidate()
 }
 
-func toOutgoing(s savedRequest, follow bool, envs []kv) *outgoing {
+func (m *model) toOutgoing(s savedRequest, follow bool, envs []kv) *outgoing {
 	headers := authHeaders(s.Auth, envs) // the auth panel's headers, before the user's own
 	headers = append(headers, append([]kv(nil), s.Headers...)...)
 	return &outgoing{
@@ -3275,6 +3408,7 @@ func toOutgoing(s savedRequest, follow bool, envs []kv) *outgoing {
 		FormFields:      append([]formField(nil), s.FormFields...),
 		Envs:            append([]kv(nil), envs...),
 		FollowRedirects: follow,
+		TimeoutSec:      m.timeoutSec,
 	}
 }
 
@@ -3363,6 +3497,7 @@ func (m *model) persist() {
 		Tabs:        tabs,
 		ActiveTab:   m.tabIdx,
 		Theme:       m.themeIdx,
+		TimeoutSec:  m.timeoutSec,
 	})
 }
 
