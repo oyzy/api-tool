@@ -510,6 +510,9 @@ func TestDeleteCollection(t *testing.T) {
 	})
 	rightClick(t, driver, "one")
 	click(t, driver, "删除")
+	// the confirm dialog stands between the menu and the deletion
+	waitFor(t, driver, func() bool { return shows(driver, "确定要删除收藏") })
+	click(t, driver, "删除") // the dialog's destructive button
 	waitFor(t, driver, func() bool { return len(m.collections) == 1 })
 	if m.collections[0].Name != "two" {
 		t.Fatalf("after delete: collections = %v, want [two]", m.collections)

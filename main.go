@@ -107,6 +107,11 @@ type model struct {
 	dataDirOpen      bool
 	dataDirNew       string
 
+	// about dialog and the delete-collection confirmation
+	aboutOpen      bool
+	deleteCollOpen bool
+	deleteCollIdx  int
+
 	// save-response-value-as-variable dialog
 	varOpen  bool
 	varName  string
@@ -643,6 +648,9 @@ func (m *model) page(c ui.C) {
 					if menu.Item("检查更新").Clicked() {
 						c.After(func() { m.updateSeq++ })
 					}
+					if menu.Item("关于 " + appName).Clicked() {
+						c.After(func() { m.aboutOpen = true })
+					}
 				})
 				themeBtn := ui.Button(c, themePresets[m.themeIdx].name).XSmall().Ghost().Tooltip("切换主题")
 				if themeBtn.Clicked() {
@@ -681,6 +689,8 @@ func (m *model) page(c ui.C) {
 	m.updateModal(c)
 	m.dataDirDialog(c)
 	m.varDialog(c)
+	m.aboutDialog(c)
+	m.deleteCollDialog(c)
 }
 
 // openVarDialog prefills the save-as-variable dialog from a response JSON
@@ -715,6 +725,71 @@ func (m *model) saveEnvVar(name, value string) {
 	m.envSets[idx].Vars = append(m.envSets[idx].Vars, kv{Key: name, Value: value})
 	m.persist()
 	m.toaster.Show("已存入环境 "+m.activeEnvName, "{{"+name+"}} 可在任意请求里引用", ui.ToastSuccess)
+}
+
+// aboutDialog shows the app's identity: version, shortcuts, where the data
+// lives, and the way to the repository.
+func (m *model) aboutDialog(c ui.C) {
+	ui.Modal(c, &m.aboutOpen, "关于 "+appName, func() {
+		theme := c.Theme()
+		ui.Column(c).Gap(12).Children(func() {
+			ui.Row(c).Gap(12).Items(ui.Center).Children(func() {
+				ui.Row(c).Size(48, 48).Radius(12).Background(theme.Primary).Center().Children(func() {
+					ui.Icon(c, icoSend).Color(theme.PrimaryForeground)
+				})
+				ui.Column(c).Gap(2).Children(func() {
+					ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+						ui.Text(c, appName).FontSize(20).Bold()
+						ui.Text(c, "v"+appVersion).Muted().Mono().FontSize(13)
+					})
+					ui.Text(c, "Postman 风格的 API 调试工具（Go，GPU 渲染，无 WebView）").Muted().FontSize(12)
+				})
+			})
+			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
+				ui.Text(c, "快捷键").Muted().FontSize(12).Width(64)
+				ui.Text(c, "Ctrl+Enter 发送 · Ctrl+S 保存 · Ctrl+T 新标签 · Ctrl+W 关标签 · Ctrl+N 新请求 · Ctrl+B 格式化 JSON").FontSize(12).Grow(1)
+			})
+			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
+				ui.Text(c, "数据目录").Muted().FontSize(12).Width(64)
+				ui.Text(c, storeFile()).Mono().FontSize(12).Grow(1).Ellipsis()
+			})
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "GitHub 主页").Outline().Icon(icoGithub).Clicked() {
+				c.After(func() { _ = app.OpenURL(repoURL) })
+			}
+			if ui.Button(c, "完成").Clicked() {
+				m.aboutOpen = false
+			}
+		})
+	})
+}
+
+// deleteCollDialog stands between the 删除 menu item and deleteCollection:
+// a saved request is the user's work, and a stray click must not take it.
+func (m *model) deleteCollDialog(c ui.C) {
+	name := "该收藏"
+	if m.deleteCollIdx >= 0 && m.deleteCollIdx < len(m.collections) {
+		name = "「" + m.collections[m.deleteCollIdx].Name + "」"
+	}
+	ui.Modal(c, &m.deleteCollOpen, "删除收藏", func() {
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Text(c, "确定要删除收藏 "+name+" 吗？").FontSize(13)
+			ui.Text(c, "删除后无法撤销；它所在的分组不受影响。").Muted().FontSize(12)
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.deleteCollOpen = false
+			}
+			if ui.Button(c, "删除").Destructive().Clicked() {
+				idx := m.deleteCollIdx
+				m.deleteCollOpen = false
+				c.After(func() { m.deleteCollection(idx) })
+			}
+		})
+	})
 }
 
 // varDialog shows the picked response value and the variable name it will be
@@ -1445,7 +1520,9 @@ func (m *model) requestMenuItems(menu *ui.MenuItems, coll int) {
 	})
 	menu.Separator()
 	if menu.Item("删除").Icon(icoTrash).Destructive().Clicked() {
-		m.c.After(func() { m.deleteCollection(coll) })
+		m.c.After(func() {
+			m.deleteCollIdx, m.deleteCollOpen = coll, true
+		})
 	}
 }
 

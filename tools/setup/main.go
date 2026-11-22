@@ -56,6 +56,11 @@ type model struct {
 
 func main() {
 	m := &model{desktop: true, startMenu: true, runAfter: true, theme: ui.LightTheme()}
+	if prev := previousInstallDir(); prev != "" && prev != defaultDir() {
+		// an upgrade: land on the directory the previous setup chose, or a
+		// second copy of the app appears next to the first one
+		m.dir = prev
+	}
 	page := ui.NewPage(ui.PageConfig{View: m.page, Theme: &m.theme})
 	cfg := page.Config(app.Config{
 		Invalidator: &m.inv,
@@ -70,6 +75,24 @@ func main() {
 	if err := app.RunCanvas(cfg, &canvas); err != nil {
 		os.Exit(1)
 	}
+}
+
+// previousInstallDir reads where an earlier setup put the app, from the same
+// registry entry that powers the system's uninstall list.
+func previousInstallDir() string {
+	out, err := exec.Command("reg", "query", uninstallKey, "/v", "InstallLocation").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "InstallLocation") {
+			continue
+		}
+		if parts := strings.Fields(line); len(parts) >= 3 {
+			return parts[len(parts)-1]
+		}
+	}
+	return ""
 }
 
 // defaultDir is where the app installs when the user leaves the path blank:
