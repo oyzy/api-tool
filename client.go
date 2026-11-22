@@ -248,6 +248,22 @@ func doRequest(ctx context.Context, o *outgoing) (httpResult, error) {
 	}
 	start := time.Now()
 	resp, err := client.Do(req)
+	if err != nil && retryViaSystemProxy(err, req.URL) {
+		// the direct connection died before it could talk HTTP: machines behind
+		// a system-wide proxy (clash & friends) need the same fallback the
+		// update checker uses
+		if up := systemProxyURL(); up != nil {
+			viaProxy := &http.Client{
+				Timeout:   30 * time.Second,
+				Transport: &http.Transport{Proxy: http.ProxyURL(up)},
+			}
+			if !o.FollowRedirects {
+				viaProxy.CheckRedirect = client.CheckRedirect
+			}
+			start = time.Now()
+			resp, err = viaProxy.Do(req)
+		}
+	}
 	if err != nil {
 		return httpResult{Err: err.Error(), Elapsed: time.Since(start)}, nil
 	}

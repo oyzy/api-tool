@@ -288,6 +288,30 @@ func httpGet(ctx context.Context, client *http.Client, target string) ([]byte, e
 	return io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 }
 
+// systemProxyURL is systemProxy as a parsed URL, nil when none is set.
+func systemProxyURL() *url.URL {
+	if p := systemProxy(); p != "" {
+		if u, err := url.Parse(p); err == nil {
+			return u
+		}
+	}
+	return nil
+}
+
+// retryViaSystemProxy says whether a failed direct connection deserves a
+// second attempt through the Windows system proxy: never for loopback
+// targets, which a proxy would only break.
+func retryViaSystemProxy(err error, u *url.URL) bool {
+	if u == nil || systemProxyURL() == nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "127.0.0.1", "localhost", "::1", "0.0.0.0":
+		return false
+	}
+	return runtime.GOOS == "windows"
+}
+
 // systemProxy reads the Windows system proxy from the registry, where clash
 // and friends publish it. Empty when none is set — the reg call is the price
 // of not adding a registry dependency.

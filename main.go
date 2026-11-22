@@ -112,6 +112,10 @@ type model struct {
 	deleteCollOpen bool
 	deleteCollIdx  int
 
+	// close-tab confirmation for tabs with unsaved changes
+	closeTabOpen bool
+	pendingClose int // the tab's id awaiting confirmation
+
 	// save-response-value-as-variable dialog
 	varOpen  bool
 	varName  string
@@ -428,6 +432,95 @@ func (m *model) closeTabByID(id int) {
 	}
 }
 
+// requestCloseTabByID stands between a close gesture and the actual close: a
+// tab with unsaved changes gets a confirmation, a clean one closes at once.
+func (m *model) requestCloseTabByID(id int) {
+	for i := range m.tabs {
+		if m.tabs[i].id == id {
+			m.requestCloseTab(i)
+			return
+		}
+	}
+}
+
+// requestCloseTab is the index form of requestCloseTabByID.
+func (m *model) requestCloseTab(i int) {
+	if i < 0 || i >= len(m.tabs) {
+		return
+	}
+	if !m.tabDirty(m.tabs[i]) {
+		m.closeTab(i)
+		return
+	}
+	m.pendingClose = m.tabs[i].id
+	m.closeTabOpen = true
+}
+
+// saveAndCloseTab writes the tab's request into the collection entry it edits
+// (a fresh tab has nothing to save) and closes it without further ado.
+func (m *model) saveAndCloseTab(id int) {
+	for i := range m.tabs {
+		if m.tabs[i].id != id {
+			continue
+		}
+		t := m.tabs[i]
+		if t.editing >= 0 && t.editing < len(m.collections) {
+			s := t.toSaved(m.collections[t.editing].Name)
+			s.Group = m.collections[t.editing].Group
+			m.collections[t.editing] = s
+			m.persist()
+		}
+		m.closeTabOpen = false // the tab is gone; its confirmation goes with it
+		m.closeTab(i)
+		return
+	}
+}
+
+// closeTabDialog stands between the × and a dirty tab's removal.
+func (m *model) closeTabDialog(c ui.C) {
+	title := "该标签"
+	for i := range m.tabs {
+		if m.tabs[i].id == m.pendingClose {
+			title = m.tabTitle(m.tabs[i])
+			break
+		}
+	}
+	ui.Modal(c, &m.closeTabOpen, "关闭标签", func() {
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Text(c, "「"+title+"」有未保存的修改，关闭后这些修改不会保留。").FontSize(13)
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.closeTabOpen = false
+			}
+			if ui.Button(c, "直接关闭").Destructive().Clicked() {
+				id := m.pendingClose
+				m.closeTabOpen = false
+				c.After(func() { m.closeTabByID(id) })
+			}
+			t := m.tabByID(m.pendingClose)
+			if t != nil && t.editing >= 0 {
+				if ui.Button(c, "保存并关闭").Clicked() {
+					id := m.pendingClose
+					m.closeTabOpen = false
+					c.After(func() { m.saveAndCloseTab(id) })
+				}
+			}
+		})
+	})
+}
+
+// tabByID finds a tab by its id.
+func (m *model) tabByID(id int) *tabState {
+	for i := range m.tabs {
+		if m.tabs[i].id == id {
+			return m.tabs[i]
+		}
+	}
+	return nil
+}
+
 // focusTabID brings the tab with the given id to the front.
 func (m *model) focusTabID(id int) {
 	for i := range m.tabs {
@@ -619,7 +712,7 @@ func (m *model) page(c ui.C) {
 		m.newRequest()
 	}
 	if ui.Shortcut(c, ui.Primary, "w") {
-		c.After(func() { m.closeTab(m.tabIdx) })
+		c.After(func() { m.requestCloseTab(m.tabIdx) })
 	}
 	if ui.Shortcut(c, ui.Primary, "n") {
 		m.newRequest()
@@ -691,6 +784,7 @@ func (m *model) page(c ui.C) {
 	m.varDialog(c)
 	m.aboutDialog(c)
 	m.deleteCollDialog(c)
+	m.closeTabDialog(c)
 }
 
 // openVarDialog prefills the save-as-variable dialog from a response JSON
@@ -2282,7 +2376,7 @@ func (m *model) tabStrip(c ui.C, theme *ui.Theme) {
 							ui.Spinner(c)
 						}
 						if ui.Button(c, "关闭标签").XSmall().Ghost().Icon(icoClose).IconOnly().Clicked() {
-							c.After(func() { m.closeTabByID(id) })
+							c.After(func() { m.requestCloseTabByID(id) })
 						}
 					})
 					if chip.Clicked() {
@@ -2860,6 +2954,15 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 			return
 		}
 		emptyState(c, theme, icoSend, "尚未发送请求", "填好地址后点击发送，或按 Ctrl+Enter")
+		ui.Row(c).Center().Children(func() {
+			if ui.Button(c, "试一个示例请求").Outline().Icon(icoSend).Clicked() {
+				c.After(func() {
+					m.t().method = "GET"
+					m.t().url = "https://api.github.com"
+					m.send()
+				})
+			}
+		})
 		return
 	}
 	if m.t().jsonRoot != nil {
@@ -3031,12 +3134,35 @@ func (m *model) applyResult(i int, r httpResult, err error) {
 		t.respLines = []string{"(空响应体)"}
 		t.respMeta = fmt.Sprintf("%d ms · %s", r.Elapsed.Milliseconds(), formatSize(r.Size))
 	} else {
-		t.respLines = strings.Split(r.Body, "\n")
+		t.respLines = cappedLines(r.Body, maxTextLines)
 		t.respMeta = fmt.Sprintf("%d ms · %s", r.Elapsed.Milliseconds(), formatSize(r.Size))
 	}
-	t.jsonRoot = parseJSONTree(r.Body)
+	// the JSON tree is the expensive view: past a size cap the response falls
+	// back to the text view, and the text view itself shows a bounded number
+	// of lines (复制响应体 always carries the full body).
+	if len(r.Body) <= maxTreeBytes {
+		t.jsonRoot = parseJSONTree(r.Body)
+	} else {
+		t.jsonRoot = nil
+	}
 	t.rebuildJSONRows()
 	t.assertResults = runAssertions(t.assertions, m.activeEnvs(), &r)
+}
+
+const (
+	maxTreeBytes = 10 << 20 // responses past this skip the JSON tree
+	maxTextLines = 2000     // text-view lines shown before truncation
+)
+
+// cappedLines splits a body into lines and bounds the display, appending a
+// marker that says how much was left out.
+func cappedLines(body string, limit int) []string {
+	lines := strings.Split(body, "\n")
+	if len(lines) <= limit {
+		return lines
+	}
+	kept := append([]string(nil), lines[:limit]...)
+	return append(kept, fmt.Sprintf("…（响应过大，仅显示前 %d 行，共 %d 行；复制响应体仍为完整内容）", limit, len(lines)))
 }
 
 func (m *model) copyCode(lang string) {

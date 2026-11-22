@@ -1384,12 +1384,17 @@ func TestRequestTabs(t *testing.T) {
 		t.Fatal("the first tab lost its response while in the background")
 	}
 
-	// closing the second tab from its × returns to the first
+	// closing the second tab from its × asks first (it has unsaved changes)
 	clickN(t, driver, "关闭标签", 1)
+	waitFor(t, driver, func() bool { return shows(driver, "有未保存的修改") })
+	click(t, driver, "直接关闭")
 	waitFor(t, driver, func() bool { return len(m.tabs) == 1 && m.tabIdx == 0 })
 
-	// the last tab closes into a fresh blank one, never nothing
+	// the last tab closes into a fresh blank one, never nothing (it is dirty
+	// too: the request it sent was never saved)
 	click(t, driver, "关闭标签")
+	waitFor(t, driver, func() bool { return shows(driver, "有未保存的修改") })
+	click(t, driver, "直接关闭")
 	waitFor(t, driver, func() bool { return len(m.tabs) == 1 && m.t().url == "" && m.t().resp == nil })
 
 	// a collection entry opens in a new tab, then focuses when clicked again
@@ -1995,6 +2000,85 @@ func TestUpdateChecksum(t *testing.T) {
 	if _, err := downloadUpdate(context.Background(), bad); err == nil {
 		t.Fatal("a checksum mismatch must abort the download")
 	}
+}
+
+// TestApplyResultCaps: the JSON tree is skipped for oversized bodies and the
+// text view is bounded, with the full body still available for 复制响应体.
+func TestApplyResultCaps(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+
+	manyLines := strings.Repeat("line\n", maxTextLines+500)
+	m.applyResult(0, httpResult{Status: 200, Body: manyLines}, nil)
+	if len(m.t().respLines) != maxTextLines+1 {
+		t.Fatalf("respLines = %d, want capped %d + marker", len(m.t().respLines), maxTextLines)
+	}
+	if !strings.Contains(m.t().respLines[maxTextLines], "仅显示前") {
+		t.Fatalf("last line = %q, want the truncation marker", m.t().respLines[maxTextLines])
+	}
+
+	big := `{"pad":"` + strings.Repeat("x", maxTreeBytes) + `"}`
+	m.applyResult(0, httpResult{Status: 200, Body: big}, nil)
+	if m.t().jsonRoot != nil {
+		t.Fatal("an oversized body must skip the JSON tree")
+	}
+}
+
+// TestCloseTabGuard: a dirty tab opens the confirmation and stays until
+// 直接关闭 or 保存并关闭; a clean tab closes at once.
+func TestCloseTabGuard(t *testing.T) {
+	m := newModel()
+	m.collections = nil
+	freshTabs(m)
+
+	// a clean fresh tab closes without asking — and as the last tab, it is
+	// replaced by another fresh one rather than leaving nothing
+	m.requestCloseTab(0)
+	if len(m.tabs) != 1 || m.t().url != "" {
+		t.Fatalf("a clean tab must close into a fresh blank one")
+	}
+	m.newTab()
+
+	// a tab editing an entry with local edits: the guard holds it
+	m.collections = append(m.collections, savedRequest{Name: "接口", Method: "GET", URL: "https://a.example"})
+	m.rebuildCollRows()
+	m.tabs[0].editing = 0
+	m.tabs[0].applySaved(m.collections[0])
+	m.tabs[0].url = "https://edited.example" // dirty now
+	m.requestCloseTab(0)
+	if !m.closeTabOpen || len(m.tabs) != 2 {
+		t.Fatalf("dirty tab: closeTabOpen = %v tabs = %d, want the dialog and both tabs kept", m.closeTabOpen, len(m.tabs))
+	}
+
+	// 保存并关闭 writes the tab into the entry, then closes it
+	id := m.pendingClose
+	m.saveAndCloseTab(id)
+	if len(m.tabs) != 1 {
+		t.Fatalf("save-and-close left both tabs open")
+	}
+	if m.collections[0].URL != "https://edited.example" {
+		t.Fatalf("entry after save = %q, want the tab's URL", m.collections[0].URL)
+	}
+	if m.closeTabOpen {
+		t.Fatal("the dialog must be closed after saving")
+	}
+
+	// 直接关闭 keeps the entry untouched: the tab dies with its local edits,
+	// and as the last tab it is replaced by a fresh blank one
+	m.tabs[0].body = "local edits"
+	m.requestCloseTab(0)
+	if !m.closeTabOpen {
+		t.Fatal("the dirty tab must open the confirmation")
+	}
+	m.closeTabByID(m.pendingClose)
+	if len(m.tabs) != 1 || m.tabs[0].url != "" {
+		t.Fatalf("tabs after 直接关闭 = %d, want one fresh blank", len(m.tabs))
+	}
+	if m.collections[0].URL != "https://edited.example" {
+		t.Fatalf("entry after 直接关闭 = %q, want untouched", m.collections[0].URL)
+	}
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
 }
 
 func TestMultipleEnvs(t *testing.T) {
