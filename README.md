@@ -2,6 +2,17 @@
 
 Postman 风格的桌面 API 调试工具，中文界面。用 [Viva](https://github.com/vivaui/viva) 框架（Go，GPU 渲染，无 WebView）构建，单文件、无依赖、启动即用。
 
+![主界面](docs/screenshot-main.png)
+
+<details>
+<summary>更多截图</summary>
+
+![历史面板](docs/screenshot-history.png)
+
+![关于](docs/screenshot-about.png)
+
+</details>
+
 ## 功能
 
 - 多请求**标签页**：每个标签独立保留 URL/参数/头/体/响应，切换不丢状态，支持并发发送；工作区随应用持久化，重启恢复

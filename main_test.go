@@ -2192,6 +2192,85 @@ func TestRespHistorySwitch(t *testing.T) {
 	}
 }
 
+// TestPostmanImport: a v2.1 collection export (folders, query params,
+// headers, raw JSON body, formdata, variables) and an environment export are
+// mapped into the store's shapes.
+func TestPostmanImport(t *testing.T) {
+	collection := []byte(`{
+	  "info": {"name": "示例集合", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+	  "item": [
+	    {"name": "登录", "request": {
+	      "method": "POST",
+	      "url": {"raw": "https://api.example.com/login?app=1", "query": [{"key":"app","value":"1"}]},
+	      "header": [{"key":"Authorization","value":"Bearer abc"},{"key":"X-Skip","value":"x","disabled":true}],
+	      "body": {"mode":"raw","raw":"{\"user\":\"张三\"}","options":{"raw":{"language":"json"}}}
+	    }},
+	    {"name": "流程", "item": [
+	      {"name": "查询", "request": {"method": "GET", "url": "https://api.example.com/query/{{id}}"}}
+	    ]}
+	  ],
+	  "variable": [{"key":"id","value":"42"}]
+	}`)
+	res, err := parsePostmanFile(collection, "示例")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.collections) != 2 {
+		t.Fatalf("collections = %d, want 2", len(res.collections))
+	}
+	login := res.collections[0]
+	if login.Name != "登录" || login.Group != "" || login.Method != "POST" {
+		t.Fatalf("login = %+v", login)
+	}
+	if login.URL != "https://api.example.com/login" {
+		t.Fatalf("login URL = %q, want the query stripped", login.URL)
+	}
+	if len(login.Params) != 1 || login.Params[0].Key != "app" || login.Params[0].Value != "1" {
+		t.Fatalf("login params = %+v, want app=1", login.Params)
+	}
+	if len(login.Headers) != 2 || login.Headers[1].Disabled != true {
+		t.Fatalf("headers = %+v, want the disabled flag kept", login.Headers)
+	}
+	if login.BodyType != "json" || login.Body != `{"user":"张三"}` {
+		t.Fatalf("body = %s / %q", login.BodyType, login.Body)
+	}
+	query := res.collections[1]
+	if query.Group != "流程" || query.URL != "https://api.example.com/query/{{id}}" {
+		t.Fatalf("nested = %+v", query)
+	}
+	if len(res.groups) != 1 || res.groups[0] != "流程" {
+		t.Fatalf("groups = %v", res.groups)
+	}
+	if len(res.envSets) != 1 || res.envSets[0].Name != "示例集合" || res.envSets[0].Vars[0].Key != "id" {
+		t.Fatalf("envSets = %+v", res.envSets)
+	}
+
+	// an environment export maps to an env set
+	env := []byte(`{"name":"开发环境","values":[{"key":"url","value":"https://dev.example"},{"key":"off","value":"x","enabled":false}]}`)
+	envRes, err := parsePostmanFile(env, "环境")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envRes.envSets) != 1 || envRes.envSets[0].Name != "开发环境" || len(envRes.envSets[0].Vars) != 2 {
+		t.Fatalf("env import = %+v", envRes.envSets)
+	}
+
+	// the model absorbs the result
+	m := newModel()
+	freshTabs(m)
+	m.importPostmanFiles(nil) // a no-op must not panic
+	m.collections = nil
+	m.groups = nil
+	m.importPostmanResult(res)
+	m.importPostmanResult(envRes)
+	if len(m.collections) != 2 || len(m.groups) != 1 {
+		t.Fatalf("after merge: collections = %d groups = %d", len(m.collections), len(m.groups))
+	}
+	if m.envIndex("开发环境") < 0 {
+		t.Fatalf("env sets after merge = %+v", m.envSets)
+	}
+}
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets

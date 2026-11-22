@@ -1273,32 +1273,53 @@ func statChip(c ui.C, theme *ui.Theme, text string) {
 
 // collectionList declares the saved requests as a tree: one collapsible row
 // per group, its requests under it, with a search field over them.
+// importMenu declares the import menu off its anchor (shared by the main
+// toolbar and the fresh-install toolbar).
+func (m *model) importMenu(c ui.C, anchor ui.Box) {
+	ui.Menu(c, anchor, &m.importMenuOpen, func(menu *ui.MenuItems) {
+		if menu.Item("cURL 命令…").Clicked() {
+			m.c.After(func() { m.importOpen = true })
+		}
+		if menu.Item("集合 JSON 文件…").Clicked() {
+			m.c.After(func() { m.importCollectionsDialog() })
+		}
+		if menu.Item("Postman 文件…").Clicked() {
+			m.c.After(func() { m.importPostmanDialog() })
+		}
+	})
+}
+
 func (m *model) collectionList(c ui.C, theme *ui.Theme) {
 	if m.collQuery != m.collQuerySeen {
 		m.collQuerySeen = m.collQuery
 		m.rebuildCollRows()
 	}
+	// the search and the toolbar come FIRST: a fresh install (nothing saved
+	// yet) still needs its import and new-group entries visible
+	ui.TextField(c, &m.collQuery, "搜索", "搜索接口名").Icon(icoSearch)
 	if len(m.collections) == 0 && len(m.groups) == 0 {
+		ui.Row(c).Gap(8).Children(func() {
+			importBtn := ui.Button(c, "导入集合").Small().Ghost().Icon(icoDownload).IconOnly().Tooltip("导入 cURL 命令、集合或 Postman 文件")
+			if importBtn.Clicked() {
+				m.importMenuOpen = true
+			}
+			m.importMenu(c, importBtn)
+			if ui.Button(c, "新建分组").Small().Ghost().Icon(icoPlus).IconOnly().Tooltip("新建分组").Clicked() {
+				m.openNewGroupDialog("")
+			}
+		})
 		emptyState(c, theme, icoFolder, "暂无收藏", "保存一个请求后，它会出现在这里")
 		return
 	}
 	// no Grow: in a Column it would stretch the field down the sidebar
-	ui.TextField(c, &m.collQuery, "搜索", "搜索接口名").Icon(icoSearch)
 	ui.Row(c).Gap(8).Children(func() {
 		// Icon-only: labelled buttons overflow the 240px sidebar; the tooltips
 		// carry the names.
-		importBtn := ui.Button(c, "导入集合").Small().Ghost().Icon(icoDownload).IconOnly().Tooltip("导入 cURL 命令或集合文件")
+		importBtn := ui.Button(c, "导入集合").Small().Ghost().Icon(icoDownload).IconOnly().Tooltip("导入 cURL 命令、集合或 Postman 文件")
 		if importBtn.Clicked() {
 			m.importMenuOpen = true
 		}
-		ui.Menu(c, importBtn, &m.importMenuOpen, func(menu *ui.MenuItems) {
-			if menu.Item("cURL 命令…").Clicked() {
-				m.c.After(func() { m.importOpen = true })
-			}
-			if menu.Item("集合 JSON 文件…").Clicked() {
-				m.c.After(func() { m.importCollectionsDialog() })
-			}
-		})
+		m.importMenu(c, importBtn)
 		if ui.Button(c, "导出集合").Small().Ghost().Icon(icoUpload).IconOnly().Tooltip("导出集合到 JSON 文件").Clicked() {
 			m.c.After(func() { m.exportCollectionsToFile() })
 		}
@@ -2167,6 +2188,75 @@ func (m *model) importCollectionsDialog() {
 		return
 	}
 	m.importCollectionsFromFile(files[0])
+}
+
+// importPostmanFiles absorbs Postman exports: collections become collection
+// entries with their folder tree, environment exports become env sets (same
+// name = overwritten), and the result lands in the store.
+func (m *model) importPostmanFiles(paths []string) {
+	var res pmResult
+	imported := 0
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			m.toaster.Show("读取失败", path, ui.ToastError)
+			continue
+		}
+		part, err := parsePostmanFile(data, strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+		if err != nil {
+			m.toaster.Show("导入失败", path+": "+err.Error(), ui.ToastError)
+			continue
+		}
+		res.collections = append(res.collections, part.collections...)
+		for _, g := range part.groups {
+			if !containsString(res.groups, g) {
+				res.groups = append(res.groups, g)
+			}
+		}
+		res.envSets = append(res.envSets, part.envSets...)
+		imported++
+	}
+	if imported == 0 {
+		return
+	}
+	m.importPostmanResult(res)
+	m.toaster.Show("导入完成", fmt.Sprintf("%d 个文件：%d 个接口、%d 个环境", imported, len(res.collections), len(res.envSets)), ui.ToastSuccess)
+}
+
+// importPostmanResult merges a parsed Postman export into the store: new
+// groups and collection entries are appended, an env set with the same name
+// is overwritten by the import.
+func (m *model) importPostmanResult(res pmResult) {
+	for _, g := range res.groups {
+		if !containsString(m.groups, g) {
+			m.groups = append(m.groups, g)
+		}
+	}
+	m.collections = append(m.collections, res.collections...)
+	for _, es := range res.envSets {
+		if idx := m.envIndex(es.Name); idx >= 0 {
+			m.envSets[idx].Vars = es.Vars
+		} else {
+			m.envSets = append(m.envSets, es)
+		}
+	}
+	m.rebuildCollRows()
+	m.persist()
+}
+
+// importPostmanDialog picks Postman exports (collections or environments)
+// and hands them to the importer.
+func (m *model) importPostmanDialog() {
+	files, err := app.OpenFiles(app.OpenFileOptions{Title: "选择 Postman 导出文件"})
+	if err != nil {
+		if !errors.Is(err, app.ErrCanceled) {
+			m.toaster.Show("打开失败", err.Error(), ui.ToastError)
+		}
+		return
+	}
+	if len(files) > 0 {
+		m.importPostmanFiles(files)
+	}
 }
 
 // importCollectionsFromFile reads a collection backup and merges it.
