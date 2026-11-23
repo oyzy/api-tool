@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/ui"
 )
@@ -276,13 +277,26 @@ func (m *model) jsonRowContent(i int) {
 		}
 		valBox = ui.Text(m.c, val).Mono().FontSize(13).Color(color).Grow(1).Ellipsis().LabelFor(m.t().jsonTree.RowID(i))
 	})
-	// A scalar's value can become an environment variable: right-click it and
-	// the dialog prefills the variable's name from the node's JSON path.
-	if valBox.Valid() && !n.branch && val != "" {
+	// A scalar's value can become an environment variable or gain an
+	// assertion, and any row can hand out its JSON path: right-click and the
+	// handlers resolve the path at click time.
+	if valBox.Valid() {
 		row := i
 		ui.ContextMenu(m.c, valBox, func(menu *ui.MenuItems) {
-			if menu.Item("存为变量…").Clicked() {
-				m.c.After(func() { m.openVarDialog(row) })
+			if !n.branch && val != "" {
+				if menu.Item("存为变量…").Clicked() {
+					m.c.After(func() { m.openVarDialog(row) })
+				}
+				if menu.Item("添加断言").Clicked() {
+					m.c.After(func() { m.addAssertionFromResponse(row) })
+				}
+				menu.Separator()
+			}
+			if menu.Item("复制 JSON 路径").Clicked() {
+				if path, _, ok := m.t().jsonPathOf(row); ok && path != "" {
+					_ = app.SetClipboardText(path)
+					m.toaster.Show("已复制", path, ui.ToastSuccess)
+				}
 			}
 		})
 	}

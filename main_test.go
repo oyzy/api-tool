@@ -2271,6 +2271,81 @@ func TestPostmanImport(t *testing.T) {
 	}
 }
 
+// TestPostmanAuth: Postman's auth blocks (request-level, collection-level
+// inheritance, noauth, apikey-in-query) map onto our auth configs.
+func TestPostmanAuth(t *testing.T) {
+	collection := []byte(`{
+	  "info": {"name": "带鉴权"},
+	  "auth": {"type": "basic", "basic": [{"key":"username","value":"coll-u"},{"key":"password","value":"coll-p"}]},
+	  "item": [
+	    {"name": "继承集合鉴权", "request": {"method": "GET", "url": "https://a.example/inherited"}},
+	    {"name": "自带 bearer", "request": {"method": "GET", "url": "https://a.example/bearer",
+	      "auth": {"type": "bearer", "bearer": [{"key":"token","value":"req-tok"}]}}},
+	    {"name": "显式无鉴权", "request": {"method": "GET", "url": "https://a.example/noauth", "auth": {"type": "noauth"}}},
+	    {"name": "apikey 头", "request": {"method": "GET", "url": "https://a.example/apikey",
+	      "auth": {"type": "apikey", "apikey": [{"key":"key","value":"X-API-Key"},{"key":"value","value":"secret"}]}}}
+	  ]
+	}`)
+	res, err := parsePostmanFile(collection, "带鉴权")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.collections) != 4 {
+		t.Fatalf("collections = %d, want 4", len(res.collections))
+	}
+	if res.collections[0].Auth.Type != "basic" || res.collections[0].Auth.Username != "coll-u" {
+		t.Fatalf("inherited auth = %+v", res.collections[0].Auth)
+	}
+	if res.collections[1].Auth.Type != "bearer" || res.collections[1].Auth.Token != "req-tok" {
+		t.Fatalf("request auth = %+v, want the request's own bearer", res.collections[1].Auth)
+	}
+	if res.collections[2].Auth.Type != "" {
+		t.Fatalf("noauth = %+v, want 无", res.collections[2].Auth)
+	}
+	if res.collections[3].Auth.Type != "apikey" || res.collections[3].Auth.Key != "X-API-Key" {
+		t.Fatalf("apikey auth = %+v", res.collections[3].Auth)
+	}
+
+	// the runner honours the imported auth too
+	m := newModel()
+	freshTabs(m)
+	m.collections = res.collections
+	m.rebuildCollRows()
+	o := m.toOutgoing(m.collections[1], true, nil)
+	if o.Headers[0].Key != "Authorization" || o.Headers[0].Value != "Bearer req-tok" {
+		t.Fatalf("runner headers = %+v, want the imported bearer first", o.Headers)
+	}
+}
+
+// TestAddAssertionFromResponse: the right-click action appends a JSON-path
+// assertion (prefilled with the current value) and opens the 断言 editor.
+func TestAddAssertionFromResponse(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+	m.applyResult(0, httpResult{Status: 200, Body: `{"data":{"token":"abc123"}}`}, nil)
+
+	// the tree starts with nested branches collapsed: open data (row 1) so the
+	// token member becomes visible at row 2
+	m.t().jsonRows[1].open = true
+	m.t().rebuildJSONRows()
+
+	path, leaf, ok := m.t().jsonPathOf(2) // row 2 = the data.token member
+	if !ok || path != "data.token" || leaf != "token" {
+		t.Fatalf("path = %q leaf = %q", path, leaf)
+	}
+	if got := m.t().jsonRows[2].jsonRawValue(); got != "abc123" {
+		t.Fatalf("raw value = %q", got)
+	}
+
+	m.addAssertionFromResponse(2)
+	if len(m.t().assertions) != 1 || m.t().assertions[0].Target != "data.token" || m.t().assertions[0].Value != "abc123" {
+		t.Fatalf("assertion = %+v", m.t().assertions)
+	}
+	if m.t().reqTab != "断言" {
+		t.Fatalf("reqTab = %q, want 断言", m.t().reqTab)
+	}
+}
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets

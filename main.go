@@ -857,6 +857,22 @@ func (m *model) reqSettingsDialog(c ui.C) {
 	})
 }
 
+// addAssertionFromResponse creates a JSON-path assertion for a response row
+// (expecting what the response currently carries) and opens the 断言 editor.
+func (m *model) addAssertionFromResponse(row int) {
+	path, _, ok := m.t().jsonPathOf(row)
+	if !ok || path == "" {
+		return
+	}
+	value := ""
+	if row >= 0 && row < len(m.t().jsonRows) {
+		value = m.t().jsonRows[row].jsonRawValue()
+	}
+	t := m.t()
+	t.assertions = append(t.assertions, assertion{Kind: "json", Target: path, Value: value})
+	t.reqTab = "断言"
+}
+
 // openVarDialog prefills the save-as-variable dialog from a response JSON
 // row: the name comes from the node's path, the value from the node itself.
 func (m *model) openVarDialog(row int) {
