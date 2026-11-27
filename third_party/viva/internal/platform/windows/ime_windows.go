@@ -960,7 +960,30 @@ func decodeUTF16Character(pending, value uint16) (string, uint16, bool) {
 }
 
 func (state *windowState) textCommand(key uintptr) (platform.TextCommand, bool) {
-	return state.textCommandWith(key, modifiers()&1 != 0)
+	mods := modifiers()
+	if mods&inputpkg.ModifierControl != 0 {
+		// Ctrl chords the standard editing keys: select all, word movement
+		// and word deletion (Shift still extends: Ctrl+Shift+Left/Right).
+		switch key {
+		case 65:
+			return platform.TextSelectAll, true
+		case 37:
+			if mods&inputpkg.ModifierShift != 0 {
+				return platform.TextMoveWordLeftAndModifySelection, true
+			}
+			return platform.TextMoveWordLeft, true
+		case 39:
+			if mods&inputpkg.ModifierShift != 0 {
+				return platform.TextMoveWordRightAndModifySelection, true
+			}
+			return platform.TextMoveWordRight, true
+		case 8:
+			return platform.TextDeleteWordBackward, true
+		case 46:
+			return platform.TextDeleteWordForward, true
+		}
+	}
+	return state.textCommandWith(key, mods&inputpkg.ModifierShift != 0)
 }
 
 // textCommandWith is textCommand for a known state of the Shift key.
@@ -990,6 +1013,16 @@ func (state *windowState) textCommandWith(key uintptr, shift bool) (platform.Tex
 		return platform.TextMoveRight, true
 	case 46:
 		return platform.TextDeleteForward, true
+	case 36:
+		if shift {
+			return platform.TextMoveLineStartAndModifySelection, true
+		}
+		return platform.TextMoveLineStart, true
+	case 35:
+		if shift {
+			return platform.TextMoveLineEndAndModifySelection, true
+		}
+		return platform.TextMoveLineEnd, true
 	default:
 		return 0, false
 	}

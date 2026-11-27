@@ -287,6 +287,10 @@ func (m *model) jsonRowContent(i int) {
 				if menu.Item("存为变量…").Clicked() {
 					m.c.After(func() { m.openVarDialog(row) })
 				}
+				if menu.Item("复制值").Clicked() {
+					_ = app.SetClipboardText(n.jsonRawValue())
+					m.toaster.Show("已复制", n.jsonRawValue(), ui.ToastSuccess)
+				}
 				if menu.Item("添加断言").Clicked() {
 					m.c.After(func() { m.addAssertionFromResponse(row) })
 				}
