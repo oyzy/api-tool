@@ -44,6 +44,7 @@ type model struct {
 	histRows      []histRow // the history list's rows, a heading before each day
 	histQuery     string
 	histQuerySeen string
+	histFailOnly  bool // 只看失败：只显示状态码 4xx/5xx 的条目
 
 	// collection groups: named folders in order, their members reference them
 	// by name; collRows is the flattened rows the tree shows
@@ -132,6 +133,7 @@ type model struct {
 	varOpen  bool
 	varName  string
 	varValue string
+	varEnv   string // the env set the dialog saves into
 
 	// update check
 	updateEff   *ui.EffectState[updateInfo, int]
@@ -233,8 +235,9 @@ type tabState struct {
 	jsonTree ui.TreeState
 	respView string // "树" | "文本"
 
-	// the last few responses of this tab, for comparing runs
-	respHistory []httpResult
+	// the last few responses of this tab, for comparing runs — each entry
+	// carries the assertion results computed against IT
+	respHistory []respRun
 	respHistIdx int // which one is on screen (len-1 = newest)
 
 	codeOpen bool
@@ -244,6 +247,13 @@ type tabState struct {
 // through it; a click that switches tabs makes the next paint read another.
 func (m *model) t() *tabState {
 	return m.tabs[m.tabIdx]
+}
+
+// respRun is one kept response of a tab: the result plus the assertion
+// results computed against it, so flipping between runs keeps them honest.
+type respRun struct {
+	res     httpResult
+	asserts []assertResult
 }
 
 // collRow is one visible row of the collection tree: a group header or a
@@ -882,6 +892,7 @@ func (m *model) openVarDialog(row int) {
 	}
 	m.varName = varNameFor(path, leaf)
 	m.varValue = m.t().jsonRows[row].jsonRawValue()
+	m.varEnv = m.activeEnvName
 	m.varOpen = true
 }
 
@@ -893,18 +904,22 @@ func (m *model) saveEnvVar(name, value string) {
 		m.toaster.Show("变量名不能为空", "给变量起个名字再保存", ui.ToastError)
 		return
 	}
-	idx := m.activeEnvIndex()
+	env := m.varEnv
+	if env == "" || m.envIndex(env) < 0 {
+		env = m.activeEnvName
+	}
+	idx := m.envIndex(env)
 	for i := range m.envSets[idx].Vars {
 		if m.envSets[idx].Vars[i].Key == name {
 			m.envSets[idx].Vars[i].Value = value
 			m.persist()
-			m.toaster.Show("变量已更新", "{{"+name+"}}（环境 "+m.activeEnvName+"）", ui.ToastSuccess)
+			m.toaster.Show("变量已更新", "{{"+name+"}}（环境 "+env+"）", ui.ToastSuccess)
 			return
 		}
 	}
 	m.envSets[idx].Vars = append(m.envSets[idx].Vars, kv{Key: name, Value: value})
 	m.persist()
-	m.toaster.Show("已存入环境 "+m.activeEnvName, "{{"+name+"}} 可在任意请求里引用", ui.ToastSuccess)
+	m.toaster.Show("已存入环境 "+env, "{{"+name+"}} 可在任意请求里引用", ui.ToastSuccess)
 }
 
 // aboutDialog shows the app's identity: version, shortcuts, where the data
@@ -972,6 +987,30 @@ func (m *model) deleteCollDialog(c ui.C) {
 	})
 }
 
+// applyExtractedVars merges extracted runtime variables into the ACTIVE
+// environment (update in place, append new) — the runner's chain: one step's
+// response feeds the next step's {{references}}.
+func (m *model) applyExtractedVars(vars []kv) {
+	if len(vars) == 0 {
+		return
+	}
+	idx := m.activeEnvIndex()
+	for _, v := range vars {
+		applied := false
+		for i := range m.envSets[idx].Vars {
+			if m.envSets[idx].Vars[i].Key == v.Key {
+				m.envSets[idx].Vars[i].Value = v.Value
+				applied = true
+				break
+			}
+		}
+		if !applied {
+			m.envSets[idx].Vars = append(m.envSets[idx].Vars, v)
+		}
+	}
+	m.persist()
+}
+
 // varDialog shows the picked response value and the variable name it will be
 // saved under in the active environment.
 func (m *model) varDialog(c ui.C) {
@@ -988,7 +1027,7 @@ func (m *model) varDialog(c ui.C) {
 			})
 			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
 				ui.Text(c, "存入环境").Muted()
-				ui.Text(c, m.activeEnvName).Bold()
+				ui.Choice(c, &m.varEnv, m.envSetNames(), nil)
 				ui.Text(c, "引用：{{"+m.varName+"}}").Muted().Mono().FontSize(12).Grow(1).Ellipsis()
 			})
 			_ = theme
@@ -2023,6 +2062,9 @@ func (m *model) rebuildHistRows() {
 	q := strings.ToLower(strings.TrimSpace(m.histQuery))
 	label := ""
 	for i, s := range m.history {
+		if m.histFailOnly && (s.Status == 0 || s.Status < 400) {
+			continue // 只看失败 hides successes and in-flight entries
+		}
 		if q != "" {
 			hay := strings.ToLower(s.Name + " " + s.URL + " " + s.Method)
 			if !strings.Contains(hay, q) {
@@ -2056,8 +2098,15 @@ func (m *model) historyList(c ui.C, theme *ui.Theme) {
 			m.confirmOpen = true
 		}
 	})
+	if ui.Checkbox(c, &m.histFailOnly, "只看失败").Tooltip("只显示状态码 4xx/5xx 的请求").Changed() {
+		m.rebuildHistRows()
+	}
 	if len(m.histRows) == 0 {
-		ui.Text(c, "没有匹配“"+m.histQuery+"”的历史记录").Muted().FontSize(12)
+		if m.histFailOnly {
+			ui.Text(c, "没有失败的历史记录").Muted().FontSize(12)
+		} else {
+			ui.Text(c, "没有匹配“"+m.histQuery+"”的历史记录").Muted().FontSize(12)
+		}
 		return
 	}
 	ui.List(c, &m.histList, len(m.histRows), func(row ui.ListRow) {
@@ -2853,6 +2902,7 @@ func (m *model) assertPanel(c ui.C, theme *ui.Theme) {
 				case "json":
 					ui.TextField(row.C, &a.Target, "路径", "data.items[0].id").Grow(1)
 					ui.TextField(row.C, &a.Value, "期望值", "").Grow(1)
+					ui.Checkbox(row.C, &a.Save, "存变量").Tooltip("响应落地时把该路径的实际值写入当前环境（变量名取路径末段）")
 				case "contains":
 					ui.TextField(row.C, &a.Target, "包含文本", "成功").Grow(1)
 					ui.Text(row.C, "").Grow(1)
@@ -3193,7 +3243,7 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 				c.After(func() { m.t().showRespHistory(m.t().respHistIdx + 1) })
 			}
 			ui.Spacer(c).Grow(1)
-			ui.Text(c, m.t().respHistory[m.t().respHistIdx].StatusText).Muted().FontSize(12)
+			ui.Text(c, m.t().respHistory[m.t().respHistIdx].res.StatusText).Muted().FontSize(12)
 		})
 	}
 	if m.t().jsonRoot != nil {
@@ -3386,13 +3436,17 @@ func (m *model) applyResult(i int, r httpResult, err error) {
 			}
 		}
 	}
-	// keep the last few responses around for comparing runs
-	t.respHistory = append(t.respHistory, r)
+	checked := runAssertions(t.assertions, m.activeEnvs(), &r)
+	m.applyExtractedVars(extractVars(t.assertions, r.Body))
+	// keep the last few responses (with their own assertion results) around
+	// for comparing runs
+	t.respHistory = append(t.respHistory, respRun{res: r, asserts: checked})
 	if len(t.respHistory) > 5 {
 		t.respHistory = t.respHistory[len(t.respHistory)-5:]
 	}
 	t.respHistIdx = len(t.respHistory) - 1
-	t.resp = &t.respHistory[t.respHistIdx]
+	t.resp = &t.respHistory[t.respHistIdx].res
+	t.assertResults = t.respHistory[t.respHistIdx].asserts
 
 	if len(r.Body) <= maxTreeBytes {
 		t.jsonRoot = parseJSONTree(r.Body)
@@ -3411,15 +3465,17 @@ func (t *tabState) showRespHistory(idx int) {
 		return
 	}
 	t.respHistIdx = idx
-	t.resp = &t.respHistory[idx]
-	if len(t.respHistory[idx].Body) <= maxTreeBytes {
-		t.jsonRoot = parseJSONTree(t.respHistory[idx].Body)
+	run := t.respHistory[idx]
+	t.resp = &run.res
+	t.assertResults = run.asserts
+	if len(run.res.Body) <= maxTreeBytes {
+		t.jsonRoot = parseJSONTree(run.res.Body)
 	} else {
 		t.jsonRoot = nil
 	}
 	t.rebuildJSONRows()
-	t.respLines = cappedLines(t.respHistory[idx].Body, maxTextLines)
-	t.respMeta = fmt.Sprintf("%d ms · %s", t.respHistory[idx].Elapsed.Milliseconds(), formatSize(t.respHistory[idx].Size))
+	t.respLines = cappedLines(run.res.Body, maxTextLines)
+	t.respMeta = fmt.Sprintf("%d ms · %s", run.res.Elapsed.Milliseconds(), formatSize(run.res.Size))
 }
 
 const (
@@ -3486,6 +3542,10 @@ func (m *model) advanceRun(r httpResult, err error) {
 			details = append(details, cr.desc+"（"+cr.detail+"）")
 		}
 	}
+	// the variable chain: 存变量-flagged assertions write their extracted
+	// values into the active environment BEFORE the next step starts, so its
+	// {{references}} resolve to what the previous step actually returned
+	m.applyExtractedVars(extractVars(m.collections[idx].Assertions, r.Body))
 	m.runResults = append(m.runResults, runResult{
 		name:         name,
 		status:       r.Status,

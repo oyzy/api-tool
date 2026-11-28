@@ -2346,6 +2346,56 @@ func TestAddAssertionFromResponse(t *testing.T) {
 	}
 }
 
+// TestRunnerVarChain: the runner's variable chain — a collection step whose
+// assertion carries 存变量 extracts the response value into the active env
+// BEFORE the next step starts, so the next request's {{var}} resolves to it.
+func TestRunnerVarChain(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Path)
+		switch r.URL.Path {
+		case "/login":
+			fmt.Fprint(w, `{"data":{"token":"T-42"}}`)
+		default:
+			fmt.Fprint(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	m := newModel()
+	m.collections = nil
+	m.collections = append(m.collections,
+		savedRequest{Name: "登录", Method: "GET", URL: srv.URL + "/login",
+			Assertions: []assertion{{Kind: "json", Target: "data.token", Value: "T-42", Save: true}}},
+		savedRequest{Name: "查询", Method: "GET", URL: srv.URL + "/query/{{token}}"},
+	)
+	m.rebuildCollRows()
+
+	driver := open(t, m)
+	m.startRun([]int{0, 1})
+	waitFor(t, driver, func() bool { return !m.running })
+
+	// step 1's response value was extracted into the active environment
+	envIdx := m.activeEnvIndex()
+	found := false
+	for _, v := range m.envSets[envIdx].Vars {
+		if v.Key == "token" && v.Value == "T-42" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("env vars = %+v, want token=T-42", m.envSets[envIdx].Vars)
+	}
+	// step 2 hit the URL with the extracted token substituted in
+	if len(got) != 2 || got[1] != "/query/T-42" {
+		t.Fatalf("request paths = %v, want step 2 chained to /query/T-42", got)
+	}
+	// both steps passed their assertions
+	if len(m.runResults) != 2 {
+		t.Fatalf("run results = %d, want 2", len(m.runResults))
+	}
+}
+
 func TestMultipleEnvs(t *testing.T) {
 	_ = os.Remove(dataPath)
 	_ = os.Remove(dataPath + ".bak") // a fresh store: earlier tests may have persisted sets

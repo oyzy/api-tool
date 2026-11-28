@@ -18,6 +18,7 @@ type assertion struct {
 	Kind   string
 	Target string
 	Value  string
+	Save   bool // 存为变量：响应落地时把该路径的实际值写入当前环境
 }
 
 // assertResult is one assertion's outcome after a response.
@@ -101,6 +102,45 @@ func runAssertions(as []assertion, envs []kv, resp *httpResult) []assertResult {
 			}
 			out = append(out, res)
 		}
+	}
+	return out
+}
+
+// extractVars pulls the values of every 存变量-flagged assertion out of a
+// landed response body: the variable's name is the leaf of the assertion's
+// JSON path. Missing paths and empty leaves are skipped.
+func extractVars(as []assertion, body string) []kv {
+	var out []kv
+	var root any
+	parsed := false
+	for _, a := range as {
+		if !a.Save || a.Kind != "json" || strings.TrimSpace(a.Target) == "" {
+			continue
+		}
+		if !parsed {
+			dec := json.NewDecoder(strings.NewReader(body))
+			dec.UseNumber()
+			var extra any
+			if err := dec.Decode(&root); err != nil || dec.Decode(&extra) != io.EOF {
+				break // not a JSON document: nothing to extract
+			}
+			parsed = true
+		}
+		value, ok := jsonPathValue(root, a.Target)
+		if !ok || value == "" {
+			continue
+		}
+		name := a.Target
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		if i := strings.LastIndexByte(name, '['); i >= 0 {
+			name = strings.TrimSuffix(name[i+1:], "]")
+		}
+		if name == "" {
+			continue
+		}
+		out = append(out, kv{Key: name, Value: value})
 	}
 	return out
 }
