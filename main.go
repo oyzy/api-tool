@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -149,10 +150,17 @@ type model struct {
 	// collection runner
 	runEff     *ui.EffectState[httpResult, *outgoing]
 	running    bool
-	runQueue   []int
+	runQueue   []runStep
 	runIndex   int
 	runKey     *outgoing
 	runResults []runResult
+
+	// 数据驱动运行: the CSV the user picked, and the confirm dialog's state
+	dataRunOpen    bool
+	dataRunIndices []int
+	dataRunFile    string
+	dataRunCols    []string
+	dataRunRows    [][]string
 
 	// repaint trigger
 	inv *app.Invalidator
@@ -172,8 +180,15 @@ type model struct {
 }
 
 // runResult is one finished request of a collection run.
+// runStep is one entry of a run's queue: a collection entry, and the data row
+// it runs with (row -1 is a plain run without data).
+type runStep struct {
+	idx, row int
+}
+
 type runResult struct {
 	name         string
+	row          int // the data row this step ran with, -1 = plain run
 	status       int
 	elapsed      time.Duration
 	ok           bool
@@ -181,6 +196,7 @@ type runResult struct {
 	assertTotal  int
 	assertFailed int
 	assertDetail string // the failed assertions' details, one per line
+	bodyExcerpt  string // a failed step's response opening, for the report
 }
 
 // tabState is one open request tab: the editor's fields, the two-way sync's
@@ -241,7 +257,15 @@ type tabState struct {
 	jsonRoot *jsonNode
 	jsonRows []*jsonNode
 	jsonTree ui.TreeState
-	respView string // "树" | "文本"
+	respView string // "树" | "文本" | "对比"
+
+	// the 对比 view's cached alignment of this response against the chosen one
+	diffBase    int        // the response it compares against
+	diffBaseSel string     // the Choice's bound option text
+	diffOpts    []string   // "响应 1"…"响应 M", rebuilt when the history grows
+	diffLines   []diffLine // the cached alignment, keyed by the two indices below
+	diffKeyA    int
+	diffKeyB    int
 
 	// the last few responses of this tab, for comparing runs — each entry
 	// carries the assertion results computed against IT
@@ -833,6 +857,35 @@ func (m *model) page(c ui.C) {
 	m.deleteCollDialog(c)
 	m.closeTabDialog(c)
 	m.reqSettingsDialog(c)
+	m.dataRunDialog(c)
+}
+
+// dataRunDialog confirms the CSV the user picked: what the columns are and how
+// many passes the collection will run.
+func (m *model) dataRunDialog(c ui.C) {
+	ui.Modal(c, &m.dataRunOpen, "数据驱动运行", func() {
+		ui.Column(c).Gap(10).Children(func() {
+			ui.Text(c, m.dataRunFile).Mono().FontSize(13)
+			ui.Text(c, fmt.Sprintf("共 %d 行数据，集合将运行 %d × %d = %d 次。",
+				len(m.dataRunRows), len(m.dataRunIndices), len(m.dataRunRows),
+				len(m.dataRunIndices)*len(m.dataRunRows))).FontSize(13)
+			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
+				ui.Text(c, "列").Muted().FontSize(12)
+				ui.Text(c, strings.Join(m.dataRunCols, " · ")).FontSize(12).Grow(1).Ellipsis()
+			})
+			ui.Text(c, "每行数据以 {{列名}} 参与该轮所有请求、请求体与断言，优先于环境变量。").Muted().FontSize(12)
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.dataRunOpen = false
+			}
+			if ui.Button(c, "运行").Clicked() {
+				m.dataRunOpen = false
+				m.startDataRun(m.dataRunIndices, m.dataRunFile, m.dataRunCols, m.dataRunRows)
+			}
+		})
+	})
 }
 
 // reqSettingsDialog edits the request-wide settings: the timeout every send
@@ -1726,6 +1779,9 @@ func (m *model) requestMenuItems(menu *ui.MenuItems, coll int) {
 	if menu.Item("运行").Icon(icoPlay).Clicked() {
 		m.c.After(func() { m.startRun([]int{coll}) })
 	}
+	if menu.Item("数据驱动运行…").Icon(icoFolder).Clicked() {
+		m.c.After(func() { m.openDataRun([]int{coll}) })
+	}
 	if menu.Item("复制接口").Icon(icoCopy).Clicked() {
 		m.c.After(func() { m.duplicateCollection(coll) })
 	}
@@ -1793,6 +1849,15 @@ func (m *model) groupMenuItems(menu *ui.MenuItems, name string) {
 			}
 		}
 		m.c.After(func() { m.startRun(members) })
+	}
+	if menu.Item("数据驱动运行…").Icon(icoFolder).Clicked() {
+		var members []int
+		for i, s := range m.collections {
+			if s.Group == name || strings.HasPrefix(s.Group, name+"/") {
+				members = append(members, i)
+			}
+		}
+		m.c.After(func() { m.openDataRun(members) })
 	}
 	if name == "未分组" {
 		return
@@ -3334,8 +3399,12 @@ func (m *model) runResultsPanel(c ui.C, theme *ui.Theme) {
 			if !r.ok || r.assertFailed > 0 {
 				color = theme.Danger
 			}
+			display := r.name
+			if r.row >= 0 {
+				display += " · 第" + strconv.Itoa(r.row+1) + "行"
+			}
 			ui.Row(c).Gap(8).Items(ui.Center).PadY(3).Children(func() {
-				ui.Text(c, r.name).Grow(1).Ellipsis()
+				ui.Text(c, display).Grow(1).Ellipsis()
 				ui.Text(c, runStatusText(r)).Mono().FontSize(12).Color(color)
 			})
 		}
@@ -3346,15 +3415,16 @@ func (m *model) runResultsPanel(c ui.C, theme *ui.Theme) {
 // per step with its status, assertions and duration — ready to paste into a
 // ticket or a chat.
 func (m *model) copyRunReport() {
-	report := runReportMarkdown(m.runResults, time.Now())
+	report := runReportMarkdown(m.runResults, time.Now(), m.dataRunFile, m.dataRunCols)
 	if err := app.SetClipboardText(report); err == nil {
 		m.toaster.Show("已复制", "运行报告已复制到剪贴板", ui.ToastSuccess)
 	}
 }
 
 // runReportMarkdown renders the run as a Markdown table: the form a ticket or
-// a chat message wants.
-func runReportMarkdown(rs []runResult, now time.Time) string {
+// a chat message wants. A data-driven run names its file and marks each step
+// with the row it ran; failed steps carry a response-body excerpt.
+func runReportMarkdown(rs []runResult, now time.Time, dataFile string, cols []string) string {
 	st := runStatsOf(rs)
 	verdict := "全部通过"
 	if st.fail > 0 {
@@ -3362,8 +3432,11 @@ func runReportMarkdown(rs []runResult, now time.Time) string {
 	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("## 集合运行报告 — %s\n\n", now.Format("2006-01-02 15:04")))
-	b.WriteString(fmt.Sprintf("- 结果：%s（共 %d 步）\n- 总耗时：%s\n\n", verdict, len(rs), st.total.Round(time.Millisecond)))
-	b.WriteString("| 步骤 | 状态 | 断言 | 耗时 |\n")
+	b.WriteString(fmt.Sprintf("- 结果：%s（共 %d 步）\n- 总耗时：%s\n", verdict, len(rs), st.total.Round(time.Millisecond)))
+	if dataFile != "" && len(rs) > 0 && rs[0].row >= 0 {
+		b.WriteString(fmt.Sprintf("- 数据：%s（%d 行 × %d 列：%s）\n", dataFile, countDataRows(rs), len(cols), strings.Join(cols, "、")))
+	}
+	b.WriteString("\n| 步骤 | 状态 | 断言 | 耗时 |\n")
 	b.WriteString("| --- | --- | --- | --- |\n")
 	for _, r := range rs {
 		status := strconv.Itoa(r.status)
@@ -3374,17 +3447,49 @@ func runReportMarkdown(rs []runResult, now time.Time) string {
 		if r.assertTotal > 0 {
 			assert = fmt.Sprintf("%d/%d 通过", r.assertTotal-r.assertFailed, r.assertTotal)
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", r.name, status, assert, r.elapsed.Round(time.Millisecond)))
+		name := stepLabel(r)
+		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", name, status, assert, r.elapsed.Round(time.Millisecond)))
 	}
 	if st.assertFailed > 0 {
 		b.WriteString("\n失败断言：\n")
 		for _, r := range rs {
 			if r.assertDetail != "" {
-				b.WriteString("- " + r.name + "：" + strings.ReplaceAll(r.assertDetail, "\n", "；") + "\n")
+				b.WriteString("- " + stepLabel(r) + "：" + strings.ReplaceAll(r.assertDetail, "\n", "；") + "\n")
 			}
 		}
 	}
+	excerpted := false
+	for _, r := range rs {
+		if r.bodyExcerpt != "" {
+			if !excerpted {
+				excerpted = true
+				b.WriteString("\n失败步骤的响应片段：\n")
+			}
+			b.WriteString("- " + stepLabel(r) + "：" + r.bodyExcerpt + "\n")
+		}
+	}
 	return b.String()
+}
+
+// stepLabel names a run's step in reports: the entry's name, plus the data row
+// when the run is data-driven.
+func stepLabel(r runResult) string {
+	if r.row >= 0 {
+		return r.name + "（数据第 " + strconv.Itoa(r.row+1) + " 行）"
+	}
+	return r.name
+}
+
+// countDataRows counts the distinct data rows a run covered — max row + 1,
+// so an interrupted last pass still counts.
+func countDataRows(rs []runResult) int {
+	rows := 0
+	for _, r := range rs {
+		if r.row+1 > rows {
+			rows = r.row + 1
+		}
+	}
+	return rows
 }
 
 // statusCodeColor is the colour a response status wears: green for 2xx, blue
@@ -3413,7 +3518,7 @@ func (m *model) statusBadge(c ui.C, theme *ui.Theme) {
 	})
 }
 
-var respViews = []string{"树", "文本"}
+var respViews = []string{"树", "文本", "对比"}
 
 func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 	if m.t().resp == nil {
@@ -3451,7 +3556,7 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 		})
 	}
 	if m.t().jsonRoot != nil {
-		if m.t().respView != "文本" {
+		if m.t().respView == "树" {
 			// the tree's search sits beside the view toggle; typing narrows the
 			// rows to the matches and their ancestors
 			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
@@ -3467,7 +3572,8 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 				ui.Choice(c, &m.t().respView, respViews, nil)
 			})
 		}
-		if m.t().respView != "文本" {
+		switch m.t().respView {
+		case "树":
 			ui.Tree(c, &m.t().jsonTree, len(m.t().jsonRows), m.jsonLabelFn, m.jsonContentFn).Grow(1)
 			if i, ok := m.t().jsonTree.Toggled(); ok {
 				c.After(func() { m.t().toggleJSONRow(i) })
@@ -3479,6 +3585,9 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 				ui.Text(c, "没有匹配“"+q+"”的字段或值").Muted().FontSize(12)
 			}
 			return
+		case "对比":
+			m.respDiffView(c, theme)
+			return
 		}
 	}
 	ui.Scroll(c).Grow(1).Sideways().Children(func() {
@@ -3486,6 +3595,148 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 			ui.Text(c, line).Mono().FontSize(13)
 		}
 	})
+}
+
+// respDiffView lines the current response up against the chosen one from the
+// tab's response history: '=' in both, '+' only in the current, '-' only in
+// the base. The alignment caches per (current, base) pair.
+func (m *model) respDiffView(c ui.C, theme *ui.Theme) {
+	t := m.t()
+	if len(t.respHistory) < 2 {
+		ui.Text(c, "只有一条响应，发送第二条后才能对比。").Muted().FontSize(12)
+		return
+	}
+	if len(t.diffOpts) != len(t.respHistory) {
+		t.diffOpts = t.diffOpts[:0]
+		for i := range t.respHistory {
+			t.diffOpts = append(t.diffOpts, fmt.Sprintf("响应 %d", i+1))
+		}
+	}
+	if t.diffBase < 0 || t.diffBase >= len(t.respHistory) || t.diffBase == t.respHistIdx {
+		// default to the adjacent response: the previous one, else the next
+		if t.respHistIdx > 0 {
+			t.diffBase = t.respHistIdx - 1
+		} else {
+			t.diffBase = t.respHistIdx + 1
+		}
+		t.diffBaseSel = t.diffOpts[t.diffBase]
+	}
+	if t.diffKeyA != t.respHistIdx || t.diffKeyB != t.diffBase {
+		t.diffLines = diffLines(t.respHistory[t.respHistIdx].res.Body, t.respHistory[t.diffBase].res.Body, maxDiffLines)
+		t.diffKeyA, t.diffKeyB = t.respHistIdx, t.diffBase
+	}
+	plus, minus := 0, 0
+	for _, d := range t.diffLines {
+		switch d.sign {
+		case '+':
+			plus++
+		case '-':
+			minus++
+		}
+	}
+	ui.Row(c).Gap(10).Items(ui.Center).Children(func() {
+		ui.Text(c, fmt.Sprintf("+%d −%d", plus, minus)).Mono().FontSize(12)
+		ui.Spacer(c).Grow(1)
+		ui.Text(c, "对比对象").Muted().FontSize(12)
+		if ui.Choice(c, &t.diffBaseSel, t.diffOpts, nil).Changed() {
+			for i, o := range t.diffOpts {
+				if o == t.diffBaseSel {
+					t.diffBase = i
+					break
+				}
+			}
+			m.invalidate()
+		}
+	})
+	ui.Scroll(c).Grow(1).Children(func() {
+		for _, d := range t.diffLines {
+			color := theme.Foreground
+			switch d.sign {
+			case '+':
+				color = theme.Success
+			case '-':
+				color = theme.Danger
+			}
+			sign := "="
+			switch d.sign {
+			case '+':
+				sign = "+"
+			case '-':
+				sign = "−"
+			}
+			ui.Row(c).Gap(6).Children(func() {
+				ui.Text(c, sign).Mono().FontSize(12).Width(16).Color(color)
+				ui.Text(c, d.text).Mono().FontSize(13).Grow(1).Color(color)
+			})
+		}
+	})
+}
+
+// diffLine is one line of a response alignment: '=' in both, '+' only in the
+// current response, '-' only in the base.
+type diffLine struct {
+	sign byte
+	text string
+}
+
+// maxDiffLines caps each side of a comparison so the alignment's table stays
+// small; beyond the cap the tail collapses into a marker line.
+const maxDiffLines = 1200
+
+// diffLines aligns two bodies' lines by their longest common subsequence.
+func diffLines(now, base string, max int) []diffLine {
+	a := splitLines(now, max)
+	b := splitLines(base, max)
+	// lcs[i][j] holds the LCS length of a[i:] and b[j:]
+	lcs := make([][]int16, len(a)+1)
+	for i := range lcs {
+		lcs[i] = make([]int16, len(b)+1)
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		for j := len(b) - 1; j >= 0; j-- {
+			switch {
+			case a[i] == b[j]:
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			case lcs[i+1][j] >= lcs[i][j+1]:
+				lcs[i][j] = lcs[i+1][j]
+			default:
+				lcs[i][j] = lcs[i][j+1]
+			}
+		}
+	}
+	var out []diffLine
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			out = append(out, diffLine{'=', a[i]})
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			out = append(out, diffLine{'+', a[i]})
+			i++
+		default:
+			out = append(out, diffLine{'-', b[j]})
+			j++
+		}
+	}
+	for ; i < len(a); i++ {
+		out = append(out, diffLine{'+', a[i]})
+	}
+	for ; j < len(b); j++ {
+		out = append(out, diffLine{'-', b[j]})
+	}
+	return out
+}
+
+// splitLines breaks a body into lines (CRLF tolerated), capped.
+func splitLines(body string, max int) []string {
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	if len(lines) <= max {
+		return lines
+	}
+	out := append([]string(nil), lines[:max]...)
+	return append(out, fmt.Sprintf("…（还有 %d 行未对比）", len(lines)-max))
 }
 
 func (m *model) respHeadersPanel(c ui.C, theme *ui.Theme) {
@@ -3729,16 +3980,130 @@ func (m *model) copyCode(lang string) {
 
 // ---- collection runner ----
 
+// startRun runs the given collection entries once each.
 func (m *model) startRun(indices []int) {
+	m.startDataRun(indices, "", nil, nil)
+}
+
+// openDataRun picks a CSV file and, once it parses, opens the confirm dialog
+// that says what a row means before the run starts.
+func (m *model) openDataRun(indices []int) {
+	files, err := app.OpenFiles(app.OpenFileOptions{Title: "选择 CSV 数据文件"})
+	if err != nil {
+		if !errors.Is(err, app.ErrCanceled) {
+			m.toaster.Show("打开失败", err.Error(), ui.ToastError)
+		}
+		return
+	}
+	if len(files) == 0 {
+		return
+	}
+	b, err := os.ReadFile(files[0])
+	if err != nil {
+		m.toaster.Show("读取失败", err.Error(), ui.ToastError)
+		return
+	}
+	cols, rows, err := parseCSV(b)
+	if err != nil {
+		m.toaster.Show("解析失败", err.Error(), ui.ToastError)
+		return
+	}
+	if len(rows) == 0 {
+		m.toaster.Show("没有数据", "CSV 除表头外没有数据行", ui.ToastError)
+		return
+	}
+	m.dataRunIndices = indices
+	m.dataRunFile = filepath.Base(files[0])
+	m.dataRunCols, m.dataRunRows = cols, rows
+	m.dataRunOpen = true
+}
+
+// parseCSV reads a UTF-8 (BOM tolerated) CSV file: the first row names the
+// columns, blank rows are dropped, short rows are padded with empty cells.
+func parseCSV(b []byte) ([]string, [][]string, error) {
+	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")) // the Windows BOM
+	r := csv.NewReader(bytes.NewReader(b))
+	r.FieldsPerRecord = -1 // tolerate ragged rows
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil, fmt.Errorf("文件是空的")
+	}
+	header := make([]string, len(records[0]))
+	for i, h := range records[0] {
+		header[i] = strings.TrimSpace(h)
+	}
+	var rows [][]string
+	for _, rec := range records[1:] {
+		empty := true
+		for _, f := range rec {
+			if strings.TrimSpace(f) != "" {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			continue
+		}
+		for len(rec) < len(header) {
+			rec = append(rec, "")
+		}
+		rows = append(rows, rec)
+	}
+	return header, rows, nil
+}
+
+// startDataRun runs the entries once per CSV data row, row-major: each row
+// drives a full pass of the collection, its columns joining the variable scope
+// (row wins over the environment).
+func (m *model) startDataRun(indices []int, file string, cols []string, rows [][]string) {
 	if len(indices) == 0 {
 		return
 	}
-	m.runQueue = indices
+	var steps []runStep
+	if len(rows) == 0 {
+		for _, idx := range indices {
+			steps = append(steps, runStep{idx: idx, row: -1})
+		}
+	} else {
+		for r := range rows {
+			for _, idx := range indices {
+				steps = append(steps, runStep{idx: idx, row: r})
+			}
+		}
+	}
+	m.runQueue = steps
 	m.runIndex = 0
 	m.runResults = nil
 	m.running = true
+	m.dataRunFile, m.dataRunCols, m.dataRunRows = file, cols, rows
 	m.setNextRun()
 	m.invalidate()
+}
+
+// rowVars turns one data row into variables, the header row naming them;
+// columns beyond the header become col4, col5, ….
+func (m *model) rowVars(row int) []kv {
+	if row < 0 || row >= len(m.dataRunRows) {
+		return nil
+	}
+	var out []kv
+	for i, v := range m.dataRunRows[row] {
+		name := fmt.Sprintf("col%d", i+1)
+		if i < len(m.dataRunCols) {
+			name = m.dataRunCols[i]
+		}
+		out = append(out, kv{Key: name, Value: v})
+	}
+	return out
+}
+
+// runEnvs is the variable scope a runner step resolves against: the current
+// data row first, then the active environment.
+func (m *model) runEnvs(row int) []kv {
+	return append(m.rowVars(row), m.activeEnvs()...)
 }
 
 func (m *model) setNextRun() {
@@ -3747,20 +4112,22 @@ func (m *model) setNextRun() {
 		m.runKey = nil
 		return
 	}
-	idx := m.runQueue[m.runIndex]
-	m.runKey = m.toOutgoing(m.collections[idx], m.t().followRedirects, m.activeEnvs())
+	step := m.runQueue[m.runIndex]
+	m.runKey = m.toOutgoing(m.collections[step.idx], m.t().followRedirects, m.runEnvs(step.row))
 }
 
 func (m *model) advanceRun(r httpResult, err error) {
 	if m.runIndex >= len(m.runQueue) {
 		return
 	}
-	idx := m.runQueue[m.runIndex]
+	step := m.runQueue[m.runIndex]
+	idx := step.idx
 	name := m.collections[idx].Name
 	if err != nil {
 		r.Err = err.Error()
 	}
-	checked := runAssertions(m.collections[idx].Assertions, m.activeEnvs(), &r)
+	envs := m.runEnvs(step.row)
+	checked := runAssertions(m.collections[idx].Assertions, envs, &r)
 	failed := 0
 	var details []string
 	for _, cr := range checked {
@@ -3773,8 +4140,13 @@ func (m *model) advanceRun(r httpResult, err error) {
 	// values into the active environment BEFORE the next step starts, so its
 	// {{references}} resolve to what the previous step actually returned
 	m.applyExtractedVars(extractVars(m.collections[idx].Assertions, r.Body))
+	excerpt := ""
+	if failed > 0 || r.Status >= 400 || r.Err != "" {
+		excerpt = bodyExcerpt(r.Body, 240)
+	}
 	m.runResults = append(m.runResults, runResult{
 		name:         name,
+		row:          step.row,
 		status:       r.Status,
 		elapsed:      r.Elapsed,
 		ok:           r.Err == "",
@@ -3782,10 +4154,25 @@ func (m *model) advanceRun(r httpResult, err error) {
 		assertTotal:  len(checked),
 		assertFailed: failed,
 		assertDetail: strings.Join(details, "；"),
+		bodyExcerpt:  excerpt,
 	})
 	m.runIndex++
 	m.setNextRun()
 	m.invalidate()
+}
+
+// bodyExcerpt is a response body's opening stretch on one line, for the run
+// report's failed steps.
+func bodyExcerpt(body string, max int) string {
+	b := strings.TrimSpace(strings.ReplaceAll(body, "\r\n", "\n"))
+	if b == "" {
+		return ""
+	}
+	b = strings.ReplaceAll(b, "\n", " ⏎ ")
+	if r := []rune(b); len(r) > max {
+		b = string(r[:max]) + "…"
+	}
+	return b
 }
 
 func (m *model) toOutgoing(s savedRequest, follow bool, envs []kv) *outgoing {

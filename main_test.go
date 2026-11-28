@@ -2341,22 +2341,77 @@ func TestComposeGraphQL(t *testing.T) {
 }
 
 // TestRunReportMarkdown: the report carries the verdict, one row per step and
-// the failed assertions' details.
+// the failed assertions' details, plus data-run annotations and excerpts.
 func TestRunReportMarkdown(t *testing.T) {
 	rs := []runResult{
-		{name: "登录", status: 200, elapsed: 150 * time.Millisecond, ok: true, assertTotal: 1},
-		{name: "查询", status: 500, elapsed: 80 * time.Millisecond, assertTotal: 2, assertFailed: 1,
-			assertDetail: "data.token = T-42（路径不存在）"},
+		{name: "登录", row: -1, status: 200, elapsed: 150 * time.Millisecond, ok: true, assertTotal: 1},
+		{name: "查询", row: -1, status: 500, elapsed: 80 * time.Millisecond, assertTotal: 2, assertFailed: 1,
+			assertDetail: "data.token = T-42（路径不存在）", bodyExcerpt: `{"err":"boom"}`},
 	}
-	report := runReportMarkdown(rs, time.Unix(0, 0).UTC())
-	for _, want := range []string{"失败 1", "| 登录 | 200 |", "| 查询 | 500 |", "1/2 通过", "data.token = T-42"} {
+	report := runReportMarkdown(rs, time.Unix(0, 0).UTC(), "", nil)
+	for _, want := range []string{"失败 1", "| 登录 | 200 |", "| 查询 | 500 |", "1/2 通过", "data.token = T-42", "失败步骤的响应片段", `{"err":"boom"}`} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report missing %q:\n%s", want, report)
 		}
 	}
-	green := runReportMarkdown([]runResult{{name: "健康", status: 200, elapsed: 10 * time.Millisecond, ok: true}}, time.Unix(0, 0).UTC())
-	if !strings.Contains(green, "全部通过") || strings.Contains(green, "失败断言") {
+	green := runReportMarkdown([]runResult{{name: "健康", status: 200, elapsed: 10 * time.Millisecond, ok: true}}, time.Unix(0, 0).UTC(), "", nil)
+	if !strings.Contains(green, "全部通过") || strings.Contains(green, "失败断言") || strings.Contains(green, "响应片段") {
 		t.Fatalf("green report =\n%s", green)
+	}
+	// a data-driven run names the file and marks every step with its row
+	data := runReportMarkdown([]runResult{
+		{name: "登录", row: 0, status: 200, elapsed: time.Millisecond, ok: true},
+		{name: "查询", row: 0, status: 200, elapsed: time.Millisecond, ok: true},
+		{name: "登录", row: 1, status: 500, elapsed: time.Millisecond},
+	}, time.Unix(0, 0).UTC(), "users.csv", []string{"user", "pass"})
+	for _, want := range []string{"数据：users.csv（2 行 × 2 列：user、pass）", "（数据第 1 行）", "（数据第 2 行）"} {
+		if !strings.Contains(data, want) {
+			t.Fatalf("data report missing %q:\n%s", want, data)
+		}
+	}
+}
+
+// TestParseCSV: BOM tolerated, blank rows dropped, short rows padded.
+func TestParseCSV(t *testing.T) {
+	cols, rows, err := parseCSV([]byte("\xef\xbb\xbfuser,pass\nalice,123\n\nbob\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 2 || cols[0] != "user" || cols[1] != "pass" {
+		t.Fatalf("cols = %v", cols)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (the blank row dropped)", len(rows))
+	}
+	if len(rows[0]) != 2 || rows[0][0] != "alice" {
+		t.Fatalf("row0 = %v", rows[0])
+	}
+	if len(rows[1]) != 2 || rows[1][0] != "bob" || rows[1][1] != "" {
+		t.Fatalf("row1 = %v, want bob padded with an empty cell", rows[1])
+	}
+}
+
+// TestDiffLines: shared lines equal, the current side's extras are +, the
+// base's are −, and both sides cap with a marker.
+func TestDiffLines(t *testing.T) {
+	d := diffLines("a\nb\nc", "a\nx\nc", 100)
+	var plus, minus, same []string
+	for _, l := range d {
+		switch l.sign {
+		case '+':
+			plus = append(plus, l.text)
+		case '-':
+			minus = append(minus, l.text)
+		default:
+			same = append(same, l.text)
+		}
+	}
+	if strings.Join(same, "|") != "a|c" || strings.Join(plus, "|") != "b" || strings.Join(minus, "|") != "x" {
+		t.Fatalf("diff = %+v (same %v + %v - %v)", d, same, plus, minus)
+	}
+	capped := diffLines("1\n2\n3", "1\n2\n3", 2)
+	if len(capped) != 3 || capped[2].sign != '=' || !strings.Contains(capped[2].text, "还有") {
+		t.Fatalf("capped diff = %+v", capped)
 	}
 }
 
