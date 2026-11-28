@@ -122,6 +122,19 @@ type storeData struct {
 	ActiveTab   int            `json:"activeTab"`  // which one was on screen
 	Theme       int            `json:"theme"`      // the theme preset's index
 	TimeoutSec  int            `json:"timeoutSec"` // request timeout in seconds; 0 = 30
+	MockRules   []mockRule     `json:"mockRules"`  // the built-in mock server's canned endpoints
+	MockPort    int            `json:"mockPort"`   // the mock server's port; 0 = 18888
+}
+
+// mockRule is one canned endpoint the built-in mock server serves: a request
+// to its path receives the canned status and body. Status stays text so the
+// sidebar's inline field can bind it directly; it is parsed at serve time.
+type mockRule struct {
+	Method  string // "" matches any method
+	Path    string // exact path; the query string is ignored
+	Status  string // "" = 200
+	Body    string
+	Enabled bool
 }
 
 // dataPath overrides where the data file lives; empty uses the location the

@@ -2585,6 +2585,79 @@ func TestJSONTreeSearch(t *testing.T) {
 	}
 }
 
+// TestMockServer: the handler serves the first matching enabled rule — method
+// and path, the query ignored — with the rule's status and body; misses get a
+// 404 that names them.
+func TestMockServer(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+	m.mockRules = []mockRule{
+		{Method: "GET", Path: "/api/user", Status: "200", Body: `{"ok":true}`, Enabled: true},
+		{Method: "POST", Path: "/api/user", Status: "404", Body: `{"nope":1}`, Enabled: true},
+		{Method: "GET", Path: "/off", Status: "200", Body: "off", Enabled: false},
+		{Method: "", Path: "/any", Body: "plain text", Enabled: true},
+		{Method: "GET", Path: "/empty", Body: `["a","b"]`, Enabled: true},
+	}
+	m.publishMockRules() // the page does this each paint; the test does it by hand
+	srv := httptest.NewServer(http.HandlerFunc(m.mockServeHTTP))
+	defer srv.Close()
+
+	get := func(path string) (*http.Response, string) {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, string(b)
+	}
+	resp, body := get("/api/user?x=1")
+	if resp.StatusCode != 200 || body != `{"ok":true}` || resp.Header.Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("GET /api/user = %d %q %q", resp.StatusCode, body, resp.Header.Get("Content-Type"))
+	}
+	resp, body = get("/api/user") // POST's path: GET still hits rule 1
+	if resp.StatusCode != 200 || body != `{"ok":true}` {
+		t.Fatalf("GET same path = %d %q", resp.StatusCode, body)
+	}
+	post, err := http.Post(srv.URL+"/api/user", "text/plain", strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer post.Body.Close()
+	if post.StatusCode != 404 {
+		t.Fatalf("POST /api/user = %d, want the 404 rule", post.StatusCode)
+	}
+	resp, body = get("/off")
+	if resp.StatusCode != 404 || !strings.Contains(body, "no mock for") {
+		t.Fatalf("disabled rule served: %d %q", resp.StatusCode, body)
+	}
+	resp, body = get("/any")
+	if resp.StatusCode != 200 || body != "plain text" || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Fatalf("any-method rule = %d %q %q", resp.StatusCode, body, resp.Header.Get("Content-Type"))
+	}
+	resp, body = get("/empty")
+	if resp.StatusCode != 200 || body != `["a","b"]` { // empty status defaults to 200
+		t.Fatalf("empty-status rule = %d %q", resp.StatusCode, body)
+	}
+}
+
+// TestMockPersist: rules and port round-trip through the store.
+func TestMockPersist(t *testing.T) {
+	_ = os.Remove(dataPath)
+	_ = os.Remove(dataPath + ".bak")
+	m := newModel()
+	m.mockRules = []mockRule{{Method: "GET", Path: "/p", Status: "201", Body: "b", Enabled: true}}
+	m.mockPort = 19999
+	m.persist()
+	m2 := newModel()
+	if len(m2.mockRules) != 1 || m2.mockRules[0].Path != "/p" || m2.mockRules[0].Status != "201" || !m2.mockRules[0].Enabled {
+		t.Fatalf("rules = %+v", m2.mockRules)
+	}
+	if m2.mockPort != 19999 {
+		t.Fatalf("port = %d", m2.mockPort)
+	}
+}
+
 func TestPostmanAuth(t *testing.T) {
 	collection := []byte(`{
 	  "info": {"name": "带鉴权"},

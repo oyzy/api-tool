@@ -10,11 +10,13 @@ import (
 	"image"
 	"image/png"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "embed"
@@ -34,7 +36,7 @@ var iconPNG []byte
 // where its control is declared is the only place that changes it.
 type model struct {
 	// sidebar
-	sidebar     string // "收藏" | "历史" | "环境"
+	sidebar     string // "收藏" | "历史" | "环境" | "Mock"
 	collections []savedRequest
 	history     []savedRequest
 	histList    ui.ListState
@@ -161,6 +163,24 @@ type model struct {
 	dataRunFile    string
 	dataRunCols    []string
 	dataRunRows    [][]string
+
+	// mock 服务: canned endpoints served on 127.0.0.1 while started. The UI
+	// edits mockRules freely; publishMockRules snapshots them for the server
+	// goroutine whenever the content changes.
+	mockRules       []mockRule
+	mockPort        int
+	mockPortText    string
+	mockSrv         *http.Server
+	mockMu          sync.Mutex // guards mockServeRules, mockSrv, mockOn, mockStartErr
+	mockServeRules  []mockRule
+	mockFingerprint uint64
+	mockOn          bool
+	mockStartErr    string
+	mockList        ui.ListState
+	mockOpen        bool
+	mockEdit        int
+	mockStatusDraft string
+	mockDraft       string
 
 	// repaint trigger
 	inv *app.Invalidator
@@ -417,6 +437,8 @@ func (m *model) applyStore(data storeData) {
 		m.activeEnvName = m.envSets[0].Name
 	}
 	m.groups = data.Groups // empty folders live only here: they have no members to derive them from
+	m.mockRules = data.MockRules
+	m.mockPort = data.MockPort
 	m.collapsed = map[string]bool{}
 	m.collQuery, m.collQuerySeen = "", ""
 	m.rebuildCollRows()
@@ -716,6 +738,7 @@ func (m *model) invalidate() {
 func (m *model) page(c ui.C) {
 	m.c = c
 	theme := c.Theme()
+	m.publishMockRules()
 	// Every tab's send effect is declared each paint, whether or not its tab
 	// is on screen: stopping would cancel the request in flight. A result is
 	// applied to the tab that sent it, so it waits there for its reader.
@@ -858,6 +881,51 @@ func (m *model) page(c ui.C) {
 	m.closeTabDialog(c)
 	m.reqSettingsDialog(c)
 	m.dataRunDialog(c)
+	m.mockDialog(c)
+}
+
+// mockDialog edits one rule's status and body; the method and path edit
+// inline in the sidebar row.
+func (m *model) mockDialog(c ui.C) {
+	ui.Modal(c, &m.mockOpen, "编辑 Mock 响应", func() {
+		ui.Column(c).Gap(8).Children(func() {
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "方法与路径").Muted()
+				rule := m.mockEditRule()
+				if rule != nil {
+					ui.Text(c, rule.Method+" "+rule.Path).Mono().FontSize(12).Grow(1).Ellipsis()
+				}
+			})
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.Text(c, "状态码").Muted()
+				ui.TextField(c, &m.mockStatusDraft, "状态码", "200").Width(90)
+				ui.Text(c, "留空为 200").Muted().FontSize(12)
+				ui.Spacer(c)
+			})
+			ui.Text(c, "响应体").Muted()
+			ui.TextArea(c, &m.mockDraft, "响应体", "{\n  \"ok\": true\n}").Height(180).Grow(1).Mono()
+			if s := strings.TrimSpace(m.mockDraft); s != "" && !json.Valid([]byte(s)) {
+				ui.Text(c, "不是合法 JSON，将按 text/plain 返回").Muted().FontSize(12)
+			}
+		})
+	}, func() {
+		ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+			if ui.Button(c, "取消").Outline().Clicked() {
+				m.mockOpen = false
+			}
+			if ui.Button(c, "保存").Clicked() {
+				m.applyMockDialog()
+			}
+		})
+	})
+}
+
+// mockEditRule is the rule the dialog edits, or nil.
+func (m *model) mockEditRule() *mockRule {
+	if m.mockEdit < 0 || m.mockEdit >= len(m.mockRules) {
+		return nil
+	}
+	return &m.mockRules[m.mockEdit]
 }
 
 // dataRunDialog confirms the CSV the user picked: what the columns are and how
@@ -1355,7 +1423,7 @@ func (m *model) confirmDialog(c ui.C) {
 
 func (m *model) sidebarArea(c ui.C, theme *ui.Theme) {
 	ui.Column(c).Fill().Children(func() {
-		ui.Tabs(c, &m.sidebar, []string{"收藏", "历史", "环境"}, nil)
+		ui.Tabs(c, &m.sidebar, []string{"收藏", "历史", "环境", "Mock"}, nil)
 		switch m.sidebar {
 		case "收藏":
 			m.collectionList(c, theme)
@@ -1363,6 +1431,8 @@ func (m *model) sidebarArea(c ui.C, theme *ui.Theme) {
 			m.historyList(c, theme)
 		case "环境":
 			m.envPanel(c, theme)
+		case "Mock":
+			m.mockPanel(c, theme)
 		}
 	})
 }
@@ -2501,6 +2571,120 @@ func (m *model) envPanel(c ui.C, theme *ui.Theme) {
 			addRow(c, theme, "添加变量", func() { m.envSets[idx].Vars = append(m.envSets[idx].Vars, kv{}) })
 		})
 	})
+}
+
+// mockPanel manages the built-in mock server: its port, the on/off switch and
+// the canned rules it serves.
+func (m *model) mockPanel(c ui.C, theme *ui.Theme) {
+	ui.Column(c).Grow(1).Gap(8).PadX(10).Children(func() {
+		ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+			ui.TextField(c, &m.mockPortText, "端口", strconv.Itoa(mockDefaultPort)).Width(110)
+			ui.Spacer(c)
+			if m.mockOn {
+				if ui.Button(c, "停止").Small().Clicked() {
+					m.stopMockServer()
+				}
+			} else if ui.Button(c, "启动").Small().Clicked() {
+				if p, err := strconv.Atoi(strings.TrimSpace(m.mockPortText)); err == nil && p > 0 && p < 65536 {
+					m.mockPort = p
+				} else {
+					m.mockPort = 0
+				}
+				m.startMockServer()
+			}
+		})
+		if m.mockStartErr != "" {
+			ui.Text(c, "启动失败："+m.mockStartErr).FontSize(12).Color(theme.Danger)
+		}
+		if m.mockOn {
+			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
+				ui.Text(c, m.mockAddr()).Mono().FontSize(12).Grow(1).Ellipsis()
+				if ui.Button(c, "复制地址").Small().Ghost().Icon(icoCopy).IconOnly().Tooltip("复制 Mock 地址").Clicked() {
+					_ = app.SetClipboardText(m.mockAddr())
+					m.toaster.Show("已复制", m.mockAddr(), ui.ToastSuccess)
+				}
+			})
+			ui.Text(c, "请求 地址 + 规则路径，即返回该规则的状态码和响应体。").Muted().FontSize(12)
+		}
+		ui.Column(c).Grow(1).Clip().Border(1, theme.Border).Radius(theme.Metrics.RadiusSurface).Background(theme.Card).Children(func() {
+			if len(m.mockRules) == 0 {
+				ui.Row(c).Pad(14).Center().Children(func() {
+					ui.Text(c, "还没有规则。点下方「添加规则」，请求命中路径即返回设定响应。").Muted().FontSize(12)
+				})
+			}
+			ui.List(c, &m.mockList, len(m.mockRules), func(row ui.ListRow) {
+				i := row.Index
+				ru := &m.mockRules[i]
+				// two stacked lines: the narrow sidebar cannot fit method, path,
+				// status and two buttons side by side — and row.Element is a
+				// Row, so the stack needs an explicit Column
+				row.Element.PadX(10).PadY(3).Children(func() {
+					ui.Column(row.C).Gap(4).Children(func() {
+						ui.Row(row.C).Gap(4).Items(ui.Center).Children(func() {
+							if ui.Checkbox(row.C, &ru.Enabled, "").Self(ui.Center).Tooltip("启用或停用这一条").Changed() {
+								m.persist()
+							}
+							ui.Text(row.C, ru.Method).Mono().FontSize(11).Color(methodColor(ru.Method)).Width(40)
+							ui.Text(row.C, mockStatusText(ru.Status)).Mono().FontSize(11).Muted()
+							ui.Spacer(row.C).Grow(1)
+							if ui.Button(row.C, "编辑").Small().Ghost().Icon(icoPencil).IconOnly().Width(32).Tooltip("编辑状态码与响应体").Clicked() {
+								idx := i
+								c.After(func() { m.openMockDialog(idx) })
+							}
+							if ui.Button(row.C, "删除").Small().Ghost().Icon(icoTrash).IconOnly().Width(32).Tooltip("删除").
+								Opacity(0).StateFrom(row.Element).Hover(ui.Look{}.Opacity(1)).Transition().Clicked() {
+								idx := i
+								c.After(func() { m.removeMockRule(idx) })
+							}
+						})
+						ui.TextField(row.C, &ru.Path, "路径", "/api/...").Grow(1)
+					})
+				})
+			}).Label("Mock 规则").Grow(1)
+			addRow(c, theme, "添加规则", func() { m.addMockRule() })
+		})
+	})
+}
+
+// mockStatusText renders a rule's status: the stored text, or 200 when empty.
+func mockStatusText(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "200"
+	}
+	return s
+}
+
+func (m *model) addMockRule() {
+	m.mockRules = append(m.mockRules, mockRule{Method: "GET", Status: "200", Enabled: true})
+	m.persist()
+}
+
+func (m *model) removeMockRule(i int) {
+	if i < 0 || i >= len(m.mockRules) {
+		return
+	}
+	m.mockRules = append(m.mockRules[:i], m.mockRules[i+1:]...)
+	m.persist()
+}
+
+func (m *model) openMockDialog(i int) {
+	if i < 0 || i >= len(m.mockRules) {
+		return
+	}
+	m.mockEdit = i
+	m.mockStatusDraft = m.mockRules[i].Status
+	m.mockDraft = m.mockRules[i].Body
+	m.mockOpen = true
+}
+
+func (m *model) applyMockDialog() {
+	m.mockOpen = false
+	if m.mockEdit < 0 || m.mockEdit >= len(m.mockRules) {
+		return
+	}
+	m.mockRules[m.mockEdit].Status = strings.TrimSpace(m.mockStatusDraft)
+	m.mockRules[m.mockEdit].Body = m.mockDraft
+	m.persist()
 }
 
 // envSetNames lists the environment names in order, for the URL-row select.
@@ -4278,6 +4462,8 @@ func (m *model) persist() {
 		ActiveTab:   m.tabIdx,
 		Theme:       m.themeIdx,
 		TimeoutSec:  m.timeoutSec,
+		MockRules:   m.mockRules,
+		MockPort:    m.mockPort,
 	})
 }
 
