@@ -217,6 +217,12 @@ type tabState struct {
 	bodySeen   string
 	bodyCheck  bodyCheck
 
+	// the response tree's search, and the kv table in bulk-edit mode
+	jsonSearch     string
+	jsonSearchSeen string
+	bulkEdit       string // which kv table (参数/请求头) is text-edited, "" = none
+	bulkText       string
+
 	// editing is the index of the collection entry this tab holds, -1 when it
 	// is a fresh request (a save then appends)
 	editing int
@@ -2734,11 +2740,11 @@ func (m *model) requestPanel(c ui.C, theme *ui.Theme) {
 		})
 		switch m.t().reqTab {
 		case "参数":
-			m.kvPanel(c, theme, &m.t().paramList, &m.t().params, "添加参数")
+			m.kvPanel(c, theme, &m.t().paramList, &m.t().params, "添加参数", "参数")
 		case "认证":
 			m.authPanel(c, theme)
 		case "请求头":
-			m.kvPanel(c, theme, &m.t().headerList, &m.t().headers, "添加请求头")
+			m.kvPanel(c, theme, &m.t().headerList, &m.t().headers, "添加请求头", "请求头")
 		case "请求体":
 			m.bodyPanel(c, theme)
 		case "断言":
@@ -2766,16 +2772,36 @@ func addRow(c ui.C, theme *ui.Theme, label string, add func()) {
 // kvPanel declares an editable key-value table, Postman-style: a bordered
 // container with a 键/值 header, rows whose delete shows on hover, and a + row
 // at its foot.
-func (m *model) kvPanel(c ui.C, theme *ui.Theme, state *ui.ListState, items *[]kv, addLabel string) {
+func (m *model) kvPanel(c ui.C, theme *ui.Theme, state *ui.ListState, items *[]kv, addLabel, bulkKey string) {
 	ui.Column(c).Grow(1).Clip().Border(1, theme.Border).Radius(theme.Metrics.RadiusSurface).Background(theme.Card).Children(func() {
 		ui.Row(c).PadX(10).PadY(7).Gap(4).Background(theme.Muted).Children(func() {
 			ui.Text(c, "").Width(24)
 			ui.Text(c, "键").Muted().FontSize(12).Grow(1)
 			ui.Text(c, "值").Muted().FontSize(12).Grow(1)
+			// the buttons live in the header band: below a growing textarea
+			// they would be pushed past the card's clip and out of reach
+			if m.t().bulkEdit == bulkKey {
+				if ui.Button(c, "应用").Small().Ghost().Tooltip("把文本写回表格").Clicked() {
+					c.After(func() { m.applyBulkEdit(bulkKey, items) })
+				}
+				if ui.Button(c, "取消").Small().Ghost().Clicked() {
+					c.After(func() { m.t().bulkEdit = "" })
+				}
+			} else {
+				if ui.Button(c, "批量").Small().Ghost().Tooltip("按行批量编辑：一行一条 键: 值").Clicked() {
+					c.After(func() { m.toggleBulkEdit(bulkKey, items) })
+				}
+			}
 			// the delete column's reservation: a fixed-width blank, not a
 			// Spacer — a Spacer always grows and would squeeze the columns
 			ui.Text(c, "").Width(32)
 		})
+		if m.t().bulkEdit == bulkKey {
+			// Postman's bulk edit: the table steps aside for a plain textarea,
+			// one "key: value" pair per line (enabled rows only)
+			ui.TextArea(c, &m.t().bulkText, "批量编辑", "token: abc123\ntrace: on").Grow(1).Mono()
+			return
+		}
 		if len(*items) == 0 {
 			ui.Row(c).Pad(14).Center().Children(func() {
 				ui.Text(c, "暂无内容，点下方「"+addLabel+"」新建一行。").Muted().FontSize(12)
@@ -2798,6 +2824,58 @@ func (m *model) kvPanel(c ui.C, theme *ui.Theme, state *ui.ListState, items *[]k
 		}).Label("键值列表").Grow(1)
 		addRow(c, theme, addLabel, func() { *items = append(*items, kv{}) })
 	})
+}
+
+// toggleBulkEdit enters a table's bulk-edit mode with the enabled rows as
+// text, or (the table already being edited) leaves it via the same commit
+// 应用 runs.
+func (m *model) toggleBulkEdit(key string, items *[]kv) {
+	if m.t().bulkEdit == key {
+		m.applyBulkEdit(key, items)
+		return
+	}
+	m.t().bulkEdit = key
+	m.t().bulkText = buildBulkText(*items)
+}
+
+// applyBulkEdit replaces the table with what the textarea holds, then leaves
+// bulk mode. Only enabled rows round-trip — the same rule Postman applies.
+func (m *model) applyBulkEdit(key string, items *[]kv) {
+	if m.t().bulkEdit != key {
+		return
+	}
+	*items = parseBulkLines(m.t().bulkText)
+	m.t().bulkEdit = ""
+}
+
+// buildBulkText renders the enabled rows as "key: value" lines.
+func buildBulkText(items []kv) string {
+	var b strings.Builder
+	for _, it := range items {
+		if it.Disabled {
+			continue
+		}
+		b.WriteString(it.Key + ": " + it.Value + "\n")
+	}
+	return b.String()
+}
+
+// parseBulkLines reads "key: value" lines back; blank lines and lines without
+// a colon are skipped.
+func parseBulkLines(s string) []kv {
+	var out []kv
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(k) == "" {
+			continue
+		}
+		out = append(out, kv{Key: strings.TrimSpace(k), Value: strings.TrimSpace(v)})
+	}
+	return out
 }
 
 // formPanel declares the fields of a multipart/form-data body, in the same
@@ -3373,9 +3451,22 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 		})
 	}
 	if m.t().jsonRoot != nil {
-		ui.Row(c).Justify(ui.End).Items(ui.Center).Children(func() {
-			ui.Choice(c, &m.t().respView, respViews, nil)
-		})
+		if m.t().respView != "文本" {
+			// the tree's search sits beside the view toggle; typing narrows the
+			// rows to the matches and their ancestors
+			ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+				ui.TextField(c, &m.t().jsonSearch, "搜索", "字段或值").Grow(1).Icon(icoSearch)
+				ui.Choice(c, &m.t().respView, respViews, nil)
+			})
+			if m.t().jsonSearch != m.t().jsonSearchSeen {
+				m.t().jsonSearchSeen = m.t().jsonSearch
+				m.t().rebuildJSONRows()
+			}
+		} else {
+			ui.Row(c).Justify(ui.End).Items(ui.Center).Children(func() {
+				ui.Choice(c, &m.t().respView, respViews, nil)
+			})
+		}
 		if m.t().respView != "文本" {
 			ui.Tree(c, &m.t().jsonTree, len(m.t().jsonRows), m.jsonLabelFn, m.jsonContentFn).Grow(1)
 			if i, ok := m.t().jsonTree.Toggled(); ok {
@@ -3383,6 +3474,9 @@ func (m *model) respBodyPanel(c ui.C, theme *ui.Theme) {
 			}
 			if i, ok := m.t().jsonTree.Chosen(); ok {
 				c.After(func() { m.t().toggleJSONRow(i) }) // a click on a branch row opens it too
+			}
+			if q := strings.TrimSpace(m.t().jsonSearch); q != "" && len(m.t().jsonRows) == 0 {
+				ui.Text(c, "没有匹配“"+q+"”的字段或值").Muted().FontSize(12)
 			}
 			return
 		}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -2450,6 +2451,82 @@ func TestSaveVarSingleSend(t *testing.T) {
 	}
 	if s := substituteVars(o.URL, envs); s != "http://x/query/T-42" {
 		t.Fatalf("substituted = %q", s)
+	}
+}
+
+// TestHashFuncs: the signature functions against well-known digests, with
+// arguments that mix env vars, literals and other dynamic values.
+func TestHashFuncs(t *testing.T) {
+	envs := []kv{{Key: "secret", Value: "topsecret"}}
+	cases := []struct{ in, want string }{
+		{"{{$md5(\"abc\")}}", "900150983cd24fb0d6963f7d28e17f72"},
+		{"{{$sha256(\"abc\")}}", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+		{"{{$sha1(\"abc\")}}", "a9993e364706816aba3e25717850c26c9cd0d89d"},
+		// parts join with no separator: env var + literal
+		{"{{$md5(secret, \"-x\")}}", fmt.Sprintf("%x", md5.Sum([]byte("topsecret-x")))},
+		// HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog"),
+		// cross-checked against Python's hmac stdlib
+		{"{{$hmacsha256(\"key\", \"The quick brown fox jumps over the lazy dog\")}}",
+			"f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"},
+		{"{{$base64(user, \":\", pass)}}", "dXNlcjpwYXNz"},
+		{"{{$base64decode(\"dXNlcjpwYXNz\")}}", "user:pass"},
+		{"{{$urlencode(\"a b&c\")}}", "a+b%26c"},
+		{"{{$urldecode(\"a+b%26c\")}}", "a b&c"},
+	}
+	for _, tc := range cases {
+		if got := substituteVars(tc.in, envs); got != tc.want {
+			t.Fatalf("%s = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// unknown vars inside an argument stand as literal text, visible in the result
+	if got := substituteVars("{{$md5(novar)}}", envs); got != fmt.Sprintf("%x", md5.Sum([]byte("novar"))) {
+		t.Fatalf("unknown arg = %q", got)
+	}
+	// a quoted comma stays inside one argument
+	if got := substituteVars("{{$md5(\"a,b\")}}", nil); got != fmt.Sprintf("%x", md5.Sum([]byte("a,b"))) {
+		t.Fatalf("quoted comma = %q", got)
+	}
+}
+
+// TestBulkEdit: bulk text carries enabled rows only, and parsing round-trips.
+func TestBulkEdit(t *testing.T) {
+	items := []kv{{Key: "a", Value: "1"}, {Key: "off", Value: "x", Disabled: true}, {Key: "b", Value: "2"}}
+	if text := buildBulkText(items); text != "a: 1\nb: 2\n" {
+		t.Fatalf("bulk text = %q, want the enabled rows only", text)
+	}
+	got := parseBulkLines("a: 1\n\nno colon\n  spaced : value \nempty:")
+	if len(got) != 3 || got[0].Key != "a" || got[0].Value != "1" ||
+		got[1].Key != "spaced" || got[1].Value != "value" ||
+		got[2].Key != "empty" || got[2].Value != "" {
+		t.Fatalf("parsed = %+v", got)
+	}
+}
+
+// TestJSONTreeSearch: the search keeps the matches and their ancestors,
+// expanded, in pre-order — and drops unrelated branches.
+func TestJSONTreeSearch(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+	m.applyResult(0, httpResult{Status: 200, Body: `{"data":{"token":"T-42","nested":{"deep":"hello"}},"other":1}`}, nil)
+	m.t().jsonSearch = "deep"
+	m.t().rebuildJSONRows()
+	var keys []string
+	for _, n := range m.t().jsonRows {
+		keys = append(keys, n.keyText)
+	}
+	joined := strings.Join(keys, "|")
+	if !strings.Contains(joined, "deep") || !strings.Contains(joined, "nested") || !strings.Contains(joined, "data") {
+		t.Fatalf("search rows missing the ancestor chain: %v", keys)
+	}
+	if strings.Contains(joined, "token") || strings.Contains(joined, "other") {
+		t.Fatalf("unrelated rows leaked into the search: %v", keys)
+	}
+	if len(m.t().jsonRows) != 4 { // root → data → nested → deep
+		t.Fatalf("rows = %d (%v), want 4 in pre-order", len(m.t().jsonRows), keys)
+	}
+	// right-click paths still resolve through the filtered rows
+	if _, leaf, ok := m.t().jsonPathOf(len(m.t().jsonRows) - 1); !ok || leaf != "deep" {
+		t.Fatalf("path of last row = %q ok=%v, want deep", leaf, ok)
 	}
 }
 

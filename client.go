@@ -3,10 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/md5"
 	cryptorand "crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"math/rand/v2"
 	"mime/multipart"
@@ -89,7 +95,7 @@ func substituteVars(s string, envs []kv) string {
 			end := strings.Index(s[i+2:], "}}")
 			if end >= 0 {
 				name := s[i+2 : i+2+end]
-				if v, ok := dynamicVar(name); ok {
+				if v, ok := dynamicVar(name, envs); ok {
 					b.WriteString(v)
 				} else if v := envValue(envs, name); v != "" {
 					b.WriteString(v)
@@ -107,9 +113,13 @@ func substituteVars(s string, envs []kv) string {
 }
 
 // dynamicVar evaluates the built-in {{$...}} functions: test data that must be
-// fresh on every send. Postman's names are kept where they overlap, so pasted
-// examples keep working.
-func dynamicVar(name string) (string, bool) {
+// fresh on every send, plus the hashing and encoding a signature scheme needs.
+// Postman's names are kept where they overlap, so pasted examples keep working.
+// The hashing functions take a comma-separated argument list — a bare word is
+// an env var's name, a quoted span is literal, a $token is another dynamic
+// value — so a scheme like sign = md5(secret + ":" + ts) reads as
+// {{$md5(secret, ":", $timestamp)}}.
+func dynamicVar(name string, envs []kv) (string, bool) {
 	n := strings.TrimSpace(name)
 	switch n {
 	case "$timestamp":
@@ -152,7 +162,116 @@ func dynamicVar(name string) (string, bool) {
 		}
 		return string(b), true
 	}
+	// the hashing/encoding functions: $name(arg, arg, ...)
+	if fn, rest, ok := strings.Cut(n, "("); ok && strings.HasSuffix(rest, ")") {
+		return hashFunc(fn, strings.TrimSuffix(rest, ")"), envs)
+	}
 	return "", false
+}
+
+// hashFunc evaluates the $md5/$sha256/$base64/... family. The parts join with
+// no separator; $hmacsha256's first argument is the key, the rest the message.
+func hashFunc(fn, argList string, envs []kv) (string, bool) {
+	args := splitArgs(argList)
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = evalArg(a, envs)
+	}
+	msg := strings.Join(parts, "")
+	switch fn {
+	case "$md5":
+		sum := md5.Sum([]byte(msg))
+		return hex.EncodeToString(sum[:]), true
+	case "$sha1":
+		sum := sha1.Sum([]byte(msg))
+		return hex.EncodeToString(sum[:]), true
+	case "$sha256":
+		sum := sha256.Sum256([]byte(msg))
+		return hex.EncodeToString(sum[:]), true
+	case "$hmacsha1", "$hmacsha256":
+		if len(parts) == 0 {
+			return "", true
+		}
+		var mac hash.Hash
+		if fn == "$hmacsha1" {
+			mac = hmac.New(sha1.New, []byte(parts[0]))
+		} else {
+			mac = hmac.New(sha256.New, []byte(parts[0]))
+		}
+		mac.Write([]byte(strings.Join(parts[1:], "")))
+		return hex.EncodeToString(mac.Sum(nil)), true
+	case "$base64":
+		return base64.StdEncoding.EncodeToString([]byte(msg)), true
+	case "$base64decode":
+		b, err := base64.StdEncoding.DecodeString(msg)
+		if err != nil {
+			if b, err = base64.RawStdEncoding.DecodeString(msg); err != nil {
+				if b, err = base64.URLEncoding.DecodeString(msg); err != nil {
+					if b, err = base64.RawURLEncoding.DecodeString(msg); err != nil {
+						return msg, true // not valid base64: hand it back unchanged
+					}
+				}
+			}
+		}
+		return string(b), true
+	case "$urlencode":
+		return url.QueryEscape(msg), true
+	case "$urldecode":
+		if v, err := url.QueryUnescape(msg); err == nil {
+			return v, true
+		}
+		return msg, true
+	}
+	return "", false
+}
+
+// splitArgs splits a function argument list at its top-level commas; a quoted
+// span (single or double) holds commas and spaces literally.
+func splitArgs(s string) []string {
+	var out []string
+	var b strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inQuote != 0:
+			if c == inQuote {
+				inQuote = 0
+			}
+			b.WriteByte(c)
+		case c == '\'' || c == '"':
+			inQuote = c
+			b.WriteByte(c)
+		case c == ',':
+			out = append(out, strings.TrimSpace(b.String()))
+			b.Reset()
+		default:
+			b.WriteByte(c)
+		}
+	}
+	if t := strings.TrimSpace(b.String()); t != "" || len(out) > 0 {
+		out = append(out, t)
+	}
+	return out
+}
+
+// evalArg resolves one function argument: a quoted span is literal, a $token
+// is another dynamic value, anything else names an env var — and an unknown
+// name stands as its own literal, so a typo is visible in the result.
+func evalArg(tok string, envs []kv) string {
+	if len(tok) >= 2 && (tok[0] == '\'' || tok[0] == '"') && tok[len(tok)-1] == tok[0] {
+		return tok[1 : len(tok)-1]
+	}
+	if strings.HasPrefix(tok, "$") {
+		if v, ok := dynamicVar(tok, envs); ok {
+			return v
+		}
+		return tok
+	}
+	if v := envValue(envs, tok); v != "" {
+		return v
+	}
+	return tok
 }
 
 // newUUID returns a random RFC 4122 version 4 UUID.

@@ -182,10 +182,39 @@ func jsonValueText(v any) (string, byte) {
 }
 
 // rebuildJSONRows flattens the expanded branches into the visible rows the
-// tree declares. It is a tabState method: a result landing in a background tab
-// rebuilds that tab's rows, not the one on screen.
+// tree declares. With a search query, the rows are the matches — a field or a
+// value containing the text — plus the ancestors that lead to them, expanded
+// so the path context stays readable. It is a tabState method: a result
+// landing in a background tab rebuilds that tab's rows, not the one on screen.
 func (t *tabState) rebuildJSONRows() {
 	t.jsonRows = t.jsonRows[:0]
+	if t.jsonRoot == nil {
+		return
+	}
+	if q := strings.ToLower(strings.TrimSpace(t.jsonSearch)); q != "" {
+		var walk func(*jsonNode) []*jsonNode
+		walk = func(n *jsonNode) []*jsonNode {
+			var kept []*jsonNode
+			if jsonNodeMatches(n, q) {
+				kept = append(kept, n)
+			}
+			for i := range n.children {
+				kept = append(kept, walk(&n.children[i])...)
+			}
+			if len(kept) == 0 {
+				return nil
+			}
+			if kept[0] != n { // nothing here matched: n is only the way down
+				kept = append([]*jsonNode{n}, kept...)
+			}
+			if n.branch {
+				n.open = true
+			}
+			return kept
+		}
+		t.jsonRows = append(t.jsonRows, walk(t.jsonRoot)...)
+		return
+	}
 	var walk func(*jsonNode)
 	walk = func(n *jsonNode) {
 		t.jsonRows = append(t.jsonRows, n)
@@ -195,9 +224,13 @@ func (t *tabState) rebuildJSONRows() {
 			}
 		}
 	}
-	if t.jsonRoot != nil {
-		walk(t.jsonRoot)
-	}
+	walk(t.jsonRoot)
+}
+
+// jsonNodeMatches says whether a node's key or value contains the search text.
+func jsonNodeMatches(n *jsonNode, lower string) bool {
+	return strings.Contains(strings.ToLower(n.keyText), lower) ||
+		strings.Contains(strings.ToLower(n.valText), lower)
 }
 
 // toggleJSONRow opens or closes the branch of visible row i.
