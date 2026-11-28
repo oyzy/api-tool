@@ -198,6 +198,8 @@ type tabState struct {
 	headers         []kv
 	bodyType        string
 	body            string
+	gqlQuery        string // the GraphQL editor's query (bodyType graphql)
+	gqlVars         string // the GraphQL editor's variables, as JSON text
 	formFields      []formField
 	followRedirects bool
 	auth            authConfig  // the auth panel; its headers are synthesized at send time
@@ -266,7 +268,7 @@ type collRow struct {
 	count  int    // a group row's member count
 }
 
-var bodyTypes = []string{"none", "json", "text", "form", "form-data"}
+var bodyTypes = []string{"none", "json", "graphql", "text", "form", "form-data"}
 
 func bodyTypeLabel(t string) string {
 	switch t {
@@ -274,12 +276,14 @@ func bodyTypeLabel(t string) string {
 		return "无"
 	case "json":
 		return "JSON"
+	case "graphql":
+		return "GraphQL"
 	case "text":
 		return "文本"
 	case "form":
 		return "表单"
 	case "form-data":
-		return "multipart"
+		return "form-data"
 	}
 	return t
 }
@@ -940,9 +944,9 @@ func (m *model) aboutDialog(c ui.C) {
 					ui.Text(c, "Postman 风格的 API 调试工具（Go，GPU 渲染，无 WebView）").Muted().FontSize(12)
 				})
 			})
-			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
+			ui.Row(c).Gap(6).Items(ui.Start).Children(func() {
 				ui.Text(c, "快捷键").Muted().FontSize(12).Width(64)
-				ui.Text(c, "Ctrl+Enter 发送 · Ctrl+S 保存 · Ctrl+T 新标签 · Ctrl+W 关标签 · Ctrl+N 新请求 · Ctrl+B 格式化 JSON").FontSize(12).Grow(1)
+				ui.Wrap(c, "Ctrl+Enter 发送 · Ctrl+S 保存 · Ctrl+T 新标签 · Ctrl+W 关标签 · Ctrl+N 新请求 · Ctrl+B 格式化 JSON").FontSize(12).Grow(1)
 			})
 			ui.Row(c).Gap(6).Items(ui.Center).Children(func() {
 				ui.Text(c, "数据目录").Muted().FontSize(12).Width(64)
@@ -954,7 +958,7 @@ func (m *model) aboutDialog(c ui.C) {
 			if ui.Button(c, "GitHub 主页").Outline().Icon(icoGithub).Clicked() {
 				c.After(func() { _ = app.OpenURL(repoURL) })
 			}
-			if ui.Button(c, "完成").Clicked() {
+			if ui.Button(c, "关闭").Clicked() {
 				m.aboutOpen = false
 			}
 		})
@@ -1351,9 +1355,9 @@ func (m *model) collectionList(c ui.C, theme *ui.Theme) {
 	}
 	// the search and the toolbar come FIRST: a fresh install (nothing saved
 	// yet) still needs its import and new-group entries visible
-	ui.TextField(c, &m.collQuery, "搜索", "搜索接口名").Icon(icoSearch)
+	ui.TextField(c, &m.collQuery, "搜索", "搜索接口名").Icon(icoSearch).PadX(10)
 	if len(m.collections) == 0 && len(m.groups) == 0 {
-		ui.Row(c).Gap(8).Children(func() {
+		ui.Row(c).Gap(8).PadX(10).Children(func() {
 			importBtn := ui.Button(c, "导入集合").Small().Ghost().Icon(icoDownload).IconOnly().Tooltip("导入 cURL 命令、集合或 Postman 文件")
 			if importBtn.Clicked() {
 				m.importMenuOpen = true
@@ -1367,7 +1371,7 @@ func (m *model) collectionList(c ui.C, theme *ui.Theme) {
 		return
 	}
 	// no Grow: in a Column it would stretch the field down the sidebar
-	ui.Row(c).Gap(8).Children(func() {
+	ui.Row(c).Gap(8).PadX(10).Children(func() {
 		// Icon-only: labelled buttons overflow the 240px sidebar; the tooltips
 		// carry the names.
 		importBtn := ui.Button(c, "导入集合").Small().Ghost().Icon(icoDownload).IconOnly().Tooltip("导入 cURL 命令、集合或 Postman 文件")
@@ -2092,20 +2096,22 @@ func (m *model) historyList(c ui.C, theme *ui.Theme) {
 		emptyState(c, theme, icoClock, "暂无历史", "发送请求后，在这里回看每一次调用")
 		return
 	}
-	ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+	ui.Row(c).Gap(8).PadX(10).Items(ui.Center).Children(func() {
 		ui.TextField(c, &m.histQuery, "搜索", "URL、方法").Grow(1).Icon(icoSearch)
 		if ui.Button(c, "清空历史").Small().Ghost().Icon(icoTrash).IconOnly().Tooltip("清空全部历史").Clicked() {
 			m.confirmOpen = true
 		}
 	})
-	if ui.Checkbox(c, &m.histFailOnly, "只看失败").Tooltip("只显示状态码 4xx/5xx 的请求").Changed() {
-		m.rebuildHistRows()
-	}
+	ui.Row(c).PadX(10).Children(func() {
+		if ui.Checkbox(c, &m.histFailOnly, "只看失败").Tooltip("只显示状态码 4xx/5xx 的请求").Changed() {
+			m.rebuildHistRows()
+		}
+	})
 	if len(m.histRows) == 0 {
 		if m.histFailOnly {
-			ui.Text(c, "没有失败的历史记录").Muted().FontSize(12)
+			ui.Text(c, "没有失败的历史记录").Muted().FontSize(12).PadX(10)
 		} else {
-			ui.Text(c, "没有匹配“"+m.histQuery+"”的历史记录").Muted().FontSize(12)
+			ui.Text(c, "没有匹配“"+m.histQuery+"”的历史记录").Muted().FontSize(12).PadX(10)
 		}
 		return
 	}
@@ -2127,6 +2133,9 @@ func (m *model) historyList(c ui.C, theme *ui.Theme) {
 					ui.Text(row.C, s.Method).Mono().FontSize(11).Color(methodColor(s.Method))
 					if s.Status > 0 {
 						ui.Text(row.C, strconv.Itoa(s.Status)).Mono().FontSize(11).Color(statusCodeColor(s.Status, theme))
+					}
+					if s.Ms > 0 {
+						ui.Text(row.C, strconv.FormatInt(s.Ms, 10)+" ms").Mono().FontSize(11).Muted()
 					}
 					ui.Spacer(row.C).Grow(1)
 					ui.Text(row.C, histTime(s.Time)).Mono().FontSize(11).Muted()
@@ -2365,14 +2374,14 @@ func (m *model) exportCollectionsToFile() {
 
 func (m *model) envPanel(c ui.C, theme *ui.Theme) {
 	idx := m.activeEnvIndex()
-	ui.Column(c).Grow(1).Gap(8).Children(func() {
-		ui.Paragraph(c, "在 URL、参数与请求头中用 {{名称}} 引用变量；切换环境在地址栏右侧。", 2).Muted().FontSize(12)
-		// The env is managed here: the ⋯ menu makes, renames or deletes the
-		// set this tab is editing. The row itself must not grow — it would
-		// split the tab's height with the table below.
+	ui.Column(c).Grow(1).Gap(8).PadX(10).Children(func() {
+		ui.Paragraph(c, "URL、参数、请求头与请求体里用 {{名称}} 引用变量；{{$timestamp}}、{{$uuid}}、{{$randomInt(1,999)}}、{{$randomString(8)}} 每次发送都是新值。", 3).Muted().FontSize(12)
+		// The env is managed here: the ⋯ menu makes, renames, exports or
+		// deletes the set this tab is editing. The row itself must not grow —
+		// it would split the tab's height with the table below.
 		ui.Row(c).Items(ui.Center).Children(func() {
 			ui.Text(c, "正在编辑环境 "+m.envSets[idx].Name).Grow(1).FontSize(13).Ellipsis()
-			more := ui.Button(c, "环境操作").Small().Ghost().Icon(icoMore).IconOnly().Tooltip("新建、重命名或删除环境")
+			more := ui.Button(c, "环境操作").Small().Ghost().Icon(icoMore).IconOnly().Tooltip("新建、重命名、导出或删除环境")
 			if more.Clicked() {
 				m.envMenuOpen = true
 			}
@@ -2385,6 +2394,10 @@ func (m *model) envPanel(c ui.C, theme *ui.Theme) {
 					m.c.After(func() { m.openEnvDialog(m.envSets[i].Name) })
 				}
 				menu.Separator()
+				if menu.Item("导出环境").Icon(icoDownload).Clicked() {
+					i := m.activeEnvIndex()
+					m.c.After(func() { m.exportEnvSet(i) })
+				}
 				if menu.Item("删除环境").Icon(icoTrash).Destructive().Disabled(len(m.envSets) <= 1).Clicked() {
 					i := m.activeEnvIndex()
 					m.c.After(func() { m.deleteEnvSet(i) })
@@ -2398,6 +2411,11 @@ func (m *model) envPanel(c ui.C, theme *ui.Theme) {
 				ui.Text(c, "值").Muted().FontSize(12).Grow(1)
 				ui.Text(c, "").Width(32)
 			})
+			if len(envs) == 0 {
+				ui.Row(c).Pad(14).Center().Children(func() {
+					ui.Text(c, "还没有变量。发送请求后，勾选「存变量」的断言会自动把响应值写进来；也可点下方「添加变量」手动维护。").Muted().FontSize(12)
+				})
+			}
 			ui.List(c, &m.envList, len(envs), func(row ui.ListRow) {
 				i := row.Index
 				row.Element.PadX(10).PadY(3).Gap(4).Children(func() {
@@ -2758,6 +2776,11 @@ func (m *model) kvPanel(c ui.C, theme *ui.Theme, state *ui.ListState, items *[]k
 			// Spacer — a Spacer always grows and would squeeze the columns
 			ui.Text(c, "").Width(32)
 		})
+		if len(*items) == 0 {
+			ui.Row(c).Pad(14).Center().Children(func() {
+				ui.Text(c, "暂无内容，点下方「"+addLabel+"」新建一行。").Muted().FontSize(12)
+			})
+		}
 		ui.List(c, state, len(*items), func(row ui.ListRow) {
 			i := row.Index
 			(*items)[i].Enabled = !(*items)[i].Disabled // the checkbox's mirror
@@ -3009,6 +3032,26 @@ func (m *model) bodyPanel(c ui.C, theme *ui.Theme) {
 		case "form-data":
 			m.formPanel(c, theme)
 		case "none":
+			ui.Text(c, "该请求不携带请求体。GET、DELETE 等通常选「无」；要发数据请选 JSON、GraphQL 或表单。").Muted().FontSize(12)
+		case "graphql":
+			// side by side, both growing: stacked, a growing Query pushes the
+			// Variables editor past the panel's clip and out of reach
+			ui.Row(c).Gap(12).Grow(1).Children(func() {
+				ui.Column(c).Gap(6).Grow(1).Children(func() {
+					ui.Text(c, "Query").Muted().FontSize(12)
+					ui.TextArea(c, &m.t().gqlQuery, "GraphQL Query", "query user($id: ID!) {\n  user(id: $id) {\n    name\n  }\n}").Grow(1).Mono()
+				})
+				ui.Column(c).Gap(6).Grow(1).Children(func() {
+					ui.Row(c).Gap(8).Items(ui.Center).Children(func() {
+						ui.Text(c, "Variables（JSON）").Muted().FontSize(12)
+						if v := strings.TrimSpace(m.t().gqlVars); v != "" && !json.Valid([]byte(v)) {
+							ui.Text(c, "✗ 不是有效 JSON，发送时将不带变量").FontSize(12).Color(theme.Danger)
+						}
+					})
+					ui.TextArea(c, &m.t().gqlVars, "GraphQL Variables", "{\n  \"id\": \"1\"\n}").Grow(1).Mono()
+				})
+			})
+			ui.Text(c, "发送时合成 {\"query\":…,\"variables\":…}，Content-Type 为 application/json；两处都可用 {{变量}} 和 {{$动态值}}。").Muted().FontSize(12)
 		case "json":
 			before := m.t().body
 			m.t().checkBodyJSON()
@@ -3162,25 +3205,108 @@ func (m *model) saveResponseToFile() {
 	m.toaster.Show("已保存", path, ui.ToastSuccess)
 }
 
+// runStats sums a run's steps: how many passed, how many failed (a step fails
+// on a transport error, a non-2xx where it wanted 2xx, or a failed assertion),
+// and how much wall time the steps took in total.
+type runStats struct {
+	pass, fail, assertFailed int
+	total                    time.Duration
+}
+
+func runStatsOf(rs []runResult) runStats {
+	var s runStats
+	for _, r := range rs {
+		if r.ok && r.assertFailed == 0 {
+			s.pass++
+		} else {
+			s.fail++
+		}
+		s.assertFailed += r.assertFailed
+		s.total += r.elapsed
+	}
+	return s
+}
+
 func (m *model) runResultsPanel(c ui.C, theme *ui.Theme) {
-	ui.Column(c).Gap(4).MaxHeight(150).Children(func() {
-		ui.Text(c, fmt.Sprintf("集合运行 %d/%d", len(m.runResults), len(m.runQueue))).Muted().FontSize(12)
-		ui.Scroll(c).Grow(1).Children(func() {
-			for _, r := range m.runResults {
-				color := theme.Success
-				if !r.ok || r.assertFailed > 0 {
-					color = theme.Danger
-				}
-				ui.Row(c).Gap(8).Items(ui.Center).PadY(3).Children(func() {
-					ui.Text(c, r.name).Grow(1).Ellipsis()
-					ui.Text(c, runStatusText(r)).Mono().FontSize(12).Color(color)
-				})
-			}
+	st := runStatsOf(m.runResults)
+	// the rows live in a clipped column, never in a Grow'd Scroll: inside a
+	// content-sized parent a Grow'd child shares no free room and collapses
+	// to zero height, which hid every row but the title
+	ui.Column(c).Gap(4).MaxHeight(176).Clip().Children(func() {
+		ui.Row(c).Gap(10).Items(ui.Center).Children(func() {
+			ui.Text(c, fmt.Sprintf("集合运行 %d/%d", len(m.runResults), len(m.runQueue))).Muted().FontSize(12)
 			if m.running {
-				ui.Text(c, "运行中…").Muted()
+				ui.Text(c, "运行中…").Muted().FontSize(12)
+			} else {
+				if st.fail == 0 {
+					ui.Text(c, fmt.Sprintf("全部通过 · %d 步 · 总耗时 %s", st.pass, st.total.Round(time.Millisecond))).
+						FontSize(12).Color(theme.Success)
+				} else {
+					ui.Text(c, fmt.Sprintf("通过 %d · 失败 %d · 断言失败 %d · 总耗时 %s", st.pass, st.fail, st.assertFailed, st.total.Round(time.Millisecond))).
+						FontSize(12).Color(theme.Danger)
+				}
+				ui.Spacer(c).Grow(1)
+				if ui.Button(c, "复制报告").Small().Ghost().Icon(icoCopy).Tooltip("Markdown 报告，可直接贴进工单或群聊").Clicked() {
+					m.copyRunReport()
+				}
 			}
 		})
+		for _, r := range m.runResults {
+			color := theme.Success
+			if !r.ok || r.assertFailed > 0 {
+				color = theme.Danger
+			}
+			ui.Row(c).Gap(8).Items(ui.Center).PadY(3).Children(func() {
+				ui.Text(c, r.name).Grow(1).Ellipsis()
+				ui.Text(c, runStatusText(r)).Mono().FontSize(12).Color(color)
+			})
+		}
 	})
+}
+
+// copyRunReport puts a Markdown summary of the run on the clipboard: one row
+// per step with its status, assertions and duration — ready to paste into a
+// ticket or a chat.
+func (m *model) copyRunReport() {
+	report := runReportMarkdown(m.runResults, time.Now())
+	if err := app.SetClipboardText(report); err == nil {
+		m.toaster.Show("已复制", "运行报告已复制到剪贴板", ui.ToastSuccess)
+	}
+}
+
+// runReportMarkdown renders the run as a Markdown table: the form a ticket or
+// a chat message wants.
+func runReportMarkdown(rs []runResult, now time.Time) string {
+	st := runStatsOf(rs)
+	verdict := "全部通过"
+	if st.fail > 0 {
+		verdict = fmt.Sprintf("失败 %d", st.fail)
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("## 集合运行报告 — %s\n\n", now.Format("2006-01-02 15:04")))
+	b.WriteString(fmt.Sprintf("- 结果：%s（共 %d 步）\n- 总耗时：%s\n\n", verdict, len(rs), st.total.Round(time.Millisecond)))
+	b.WriteString("| 步骤 | 状态 | 断言 | 耗时 |\n")
+	b.WriteString("| --- | --- | --- | --- |\n")
+	for _, r := range rs {
+		status := strconv.Itoa(r.status)
+		if r.err != "" {
+			status = "错误：" + r.err
+		}
+		assert := "—"
+		if r.assertTotal > 0 {
+			assert = fmt.Sprintf("%d/%d 通过", r.assertTotal-r.assertFailed, r.assertTotal)
+		}
+		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n", r.name, status, assert, r.elapsed.Round(time.Millisecond)))
+	}
+	if st.assertFailed > 0 {
+		b.WriteString("\n失败断言：\n")
+		for _, r := range rs {
+			if r.assertDetail != "" {
+				b.WriteString("- " + r.name + "：" + strings.ReplaceAll(r.assertDetail, "\n", "；") + "\n")
+			}
+		}
+	}
+	return b.String()
 }
 
 // statusCodeColor is the colour a response status wears: green for 2xx, blue
@@ -3361,13 +3487,19 @@ func (m *model) buildOutgoing() *outgoing {
 	envs := append([]kv(nil), m.activeEnvs()...)
 	headers := authHeaders(m.t().auth, envs) // the auth panel's headers, before the user's own
 	headers = append(headers, append([]kv(nil), m.t().headers...)...)
+	bodyType, body := m.t().bodyType, m.t().body
+	if bodyType == "graphql" {
+		// the wire sees a plain JSON body; the client then substitutes
+		// {{vars}} inside the composed JSON like any other
+		bodyType, body = "json", composeGraphQL(m.t().gqlQuery, m.t().gqlVars)
+	}
 	return &outgoing{
 		Method:          m.t().method,
 		URL:             m.t().url,
 		Params:          append([]kv(nil), m.t().params...),
 		Headers:         headers,
-		BodyType:        m.t().bodyType,
-		Body:            m.t().body,
+		BodyType:        bodyType,
+		Body:            body,
 		FormFields:      append([]formField(nil), m.t().formFields...),
 		Envs:            envs,
 		FollowRedirects: m.t().followRedirects,
@@ -3430,6 +3562,7 @@ func (m *model) applyResult(i int, r httpResult, err error) {
 		for hi := range m.history {
 			if m.history[hi].ID == t.histID {
 				m.history[hi].Status = r.Status
+				m.history[hi].Ms = r.Elapsed.Milliseconds()
 				m.rebuildHistRows()
 				m.persist()
 				break
@@ -3699,6 +3832,47 @@ func (m *model) deleteEnvSet(i int) {
 	}
 	m.persist()
 	m.toaster.Show("已删除环境", name, ui.ToastSuccess)
+}
+
+// exportEnvSet writes the environment as a Postman environment JSON — the same
+// shape the import reads, so a set round-trips and can be shared with Postman
+// users.
+func (m *model) exportEnvSet(i int) {
+	if i < 0 || i >= len(m.envSets) {
+		return
+	}
+	set := m.envSets[i]
+	values := make([]pmEnvValue, 0, len(set.Vars))
+	for _, v := range set.Vars {
+		values = append(values, pmEnvValue{Key: v.Key, Value: v.Value, Type: "default", Enabled: !v.Disabled})
+	}
+	b, err := json.MarshalIndent(struct {
+		Name   string       `json:"name"`
+		Values []pmEnvValue `json:"values"`
+	}{Name: set.Name, Values: values}, "", "  ")
+	if err != nil {
+		return
+	}
+	path, err := app.SaveFile(app.SaveFileOptions{
+		Title:            "导出环境",
+		SuggestedName:    set.Name + ".postman_environment.json",
+		DefaultExtension: ".json",
+	})
+	if err != nil {
+		if errors.Is(err, app.ErrCanceled) {
+			return // the user dismissed the picker
+		}
+		m.toaster.Show("导出失败", err.Error(), ui.ToastError)
+		return
+	}
+	if path == "" {
+		return
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		m.toaster.Show("导出失败", err.Error(), ui.ToastError)
+		return
+	}
+	m.toaster.Show("已导出", path, ui.ToastSuccess)
 }
 
 // deleteCollection removes a saved request from the collection list, keeping

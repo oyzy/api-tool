@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -71,8 +75,10 @@ type httpResult struct {
 
 var httpMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
-// substituteVars replaces {{name}} in s with the matching env value. Unknown
-// names stay as they are, so a typo is visible instead of silently empty.
+// substituteVars replaces {{name}} in s with the matching env value. The
+// {{$...}} built-ins are evaluated first, so every send carries fresh test
+// data. Unknown names stay as they are, so a typo is visible instead of
+// silently empty.
 func substituteVars(s string, envs []kv) string {
 	if !strings.Contains(s, "{{") {
 		return s
@@ -83,7 +89,9 @@ func substituteVars(s string, envs []kv) string {
 			end := strings.Index(s[i+2:], "}}")
 			if end >= 0 {
 				name := s[i+2 : i+2+end]
-				if v := envValue(envs, name); v != "" {
+				if v, ok := dynamicVar(name); ok {
+					b.WriteString(v)
+				} else if v := envValue(envs, name); v != "" {
 					b.WriteString(v)
 				} else {
 					b.WriteString(s[i : i+2+end+2])
@@ -96,6 +104,79 @@ func substituteVars(s string, envs []kv) string {
 		i++
 	}
 	return b.String()
+}
+
+// dynamicVar evaluates the built-in {{$...}} functions: test data that must be
+// fresh on every send. Postman's names are kept where they overlap, so pasted
+// examples keep working.
+func dynamicVar(name string) (string, bool) {
+	n := strings.TrimSpace(name)
+	switch n {
+	case "$timestamp":
+		return strconv.FormatInt(time.Now().Unix(), 10), true
+	case "$timestampMs":
+		return strconv.FormatInt(time.Now().UnixMilli(), 10), true
+	case "$uuid", "$guid":
+		return newUUID(), true
+	}
+	if rest, ok := strings.CutPrefix(n, "$randomInt"); ok {
+		lo, hi := 0, 1000
+		if args := strings.TrimSuffix(strings.TrimPrefix(rest, "("), ")"); args != "" {
+			a, b, ok := strings.Cut(args, ",")
+			if !ok {
+				if x, err := strconv.Atoi(strings.TrimSpace(args)); err == nil {
+					lo, hi = 0, x
+				}
+			} else if x, err1 := strconv.Atoi(strings.TrimSpace(a)); err1 == nil {
+				if y, err2 := strconv.Atoi(strings.TrimSpace(b)); err2 == nil {
+					lo, hi = x, y
+				}
+			}
+		}
+		if hi < lo {
+			lo, hi = hi, lo
+		}
+		return strconv.Itoa(lo + rand.IntN(hi-lo+1)), true
+	}
+	if rest, ok := strings.CutPrefix(n, "$randomString"); ok {
+		length := 8
+		if args := strings.TrimSuffix(strings.TrimPrefix(rest, "("), ")"); args != "" {
+			if x, err := strconv.Atoi(strings.TrimSpace(args)); err == nil && x > 0 && x <= 256 {
+				length = x
+			}
+		}
+		const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		b := make([]byte, length)
+		for i := range b {
+			b[i] = alphabet[rand.IntN(len(alphabet))]
+		}
+		return string(b), true
+	}
+	return "", false
+}
+
+// newUUID returns a random RFC 4122 version 4 UUID.
+func newUUID() string {
+	var b [16]byte
+	_, _ = cryptorand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// composeGraphQL folds the GraphQL editor's query and variables into the JSON
+// body the wire expects: {"query": ..., "variables": ...}. Variables that do
+// not parse as JSON are sent empty, so a half-typed editor never blocks a send.
+func composeGraphQL(query, vars string) string {
+	v := strings.TrimSpace(vars)
+	if v != "" && !json.Valid([]byte(v)) {
+		v = ""
+	}
+	b, _ := json.Marshal(struct {
+		Query     string          `json:"query"`
+		Variables json.RawMessage `json:"variables,omitempty"`
+	}{Query: query, Variables: json.RawMessage(v)})
+	return string(b)
 }
 
 // authHeaders synthesizes the headers a request's auth panel stands for, with

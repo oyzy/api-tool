@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2273,6 +2274,185 @@ func TestPostmanImport(t *testing.T) {
 
 // TestPostmanAuth: Postman's auth blocks (request-level, collection-level
 // inheritance, noauth, apikey-in-query) map onto our auth configs.
+// TestDynamicVars: the {{$...}} built-ins evaluate fresh on every call, keep
+// Postman's names, and an unknown $name stays visible instead of vanishing.
+func TestDynamicVars(t *testing.T) {
+	envs := []kv{{Key: "host", Value: "example.com"}}
+	got := substituteVars("http://{{host}}/api?t={{$timestamp}}", envs)
+	if !strings.HasPrefix(got, "http://example.com/api?t=") || strings.Contains(got, "{{$timestamp}}") {
+		t.Fatalf("timestamp substitution = %q", got)
+	}
+	ts := substituteVars("{{$timestamp}}", nil)
+	if n, err := strconv.ParseInt(ts, 10, 64); err != nil || len(ts) != 10 || n <= 0 {
+		t.Fatalf("timestamp = %q, want a 10-digit epoch second", ts)
+	}
+	ms := substituteVars("{{$timestampMs}}", nil)
+	if n, err := strconv.ParseInt(ms, 10, 64); err != nil || n < 1_000_000_000_000 {
+		t.Fatalf("timestampMs = %q, want an epoch millisecond", ms)
+	}
+	u := substituteVars("{{$uuid}}", nil)
+	if len(u) != 36 || u[8] != '-' || u[13] != '-' || u[14] != '4' || u[18] != '-' || u[23] != '-' {
+		t.Fatalf("uuid = %q, want a v4 UUID", u)
+	}
+	if substituteVars("{{$guid}}", nil) == substituteVars("{{$guid}}", nil) {
+		t.Fatal("two $guid calls produced the same value")
+	}
+	for i := 0; i < 50; i++ {
+		n, err := strconv.Atoi(substituteVars("{{$randomInt(7,9)}}", nil))
+		if err != nil || n < 7 || n > 9 {
+			t.Fatalf("randomInt = %d (err %v), want within [7,9]", n, err)
+		}
+	}
+	if s := substituteVars("{{$randomString(12)}}", nil); len(s) != 12 {
+		t.Fatalf("randomString = %q, want 12 chars", s)
+	}
+	if s := substituteVars("{{$randomString}}", nil); len(s) != 8 {
+		t.Fatalf("randomString default = %q, want 8 chars", s)
+	}
+	if got := substituteVars("{{$nope}}", nil); got != "{{$nope}}" {
+		t.Fatalf("unknown dynamic var = %q, want left as-is", got)
+	}
+}
+
+// TestComposeGraphQL: the editor's query and variables fold into the JSON body
+// the wire expects; variables that do not parse go empty instead of blocking.
+func TestComposeGraphQL(t *testing.T) {
+	var m map[string]any
+	got := composeGraphQL("query { user { name } }", `{"id": "7"}`)
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatalf("composed body is not JSON: %v", err)
+	}
+	if m["query"] != "query { user { name } }" {
+		t.Fatalf("query = %v", m["query"])
+	}
+	vars, ok := m["variables"].(map[string]any)
+	if !ok || vars["id"] != "7" {
+		t.Fatalf("variables = %v", m["variables"])
+	}
+	got = composeGraphQL("query { u }", `{"id": `)
+	m = nil // a fresh map: Unmarshal merges into what is already there
+	if err := json.Unmarshal([]byte(got), &m); err != nil {
+		t.Fatalf("invalid variables broke the body: %v", err)
+	}
+	if _, ok := m["variables"]; ok {
+		t.Fatalf("invalid variables = %v, want omitted", m["variables"])
+	}
+}
+
+// TestRunReportMarkdown: the report carries the verdict, one row per step and
+// the failed assertions' details.
+func TestRunReportMarkdown(t *testing.T) {
+	rs := []runResult{
+		{name: "登录", status: 200, elapsed: 150 * time.Millisecond, ok: true, assertTotal: 1},
+		{name: "查询", status: 500, elapsed: 80 * time.Millisecond, assertTotal: 2, assertFailed: 1,
+			assertDetail: "data.token = T-42（路径不存在）"},
+	}
+	report := runReportMarkdown(rs, time.Unix(0, 0).UTC())
+	for _, want := range []string{"失败 1", "| 登录 | 200 |", "| 查询 | 500 |", "1/2 通过", "data.token = T-42"} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report missing %q:\n%s", want, report)
+		}
+	}
+	green := runReportMarkdown([]runResult{{name: "健康", status: 200, elapsed: 10 * time.Millisecond, ok: true}}, time.Unix(0, 0).UTC())
+	if !strings.Contains(green, "全部通过") || strings.Contains(green, "失败断言") {
+		t.Fatalf("green report =\n%s", green)
+	}
+}
+
+// TestPostmanGraphQLAndEnv: collection exports with a GraphQL body import into
+// the GraphQL editor, environment exports with enabled:false arrive disabled,
+// and our own environment export round-trips through the same parser.
+func TestPostmanGraphQLAndEnv(t *testing.T) {
+	collection := []byte(`{
+	  "info": {"name": "gql"},
+	  "item": [
+	    {"name": "用户查询", "request": {"method": "POST", "url": "https://a.example/graphql",
+	      "body": {"mode": "graphql", "graphql": {"query": "query { user }", "variables": {"id": "3"}}}}}
+	  ]
+	}`)
+	res, err := parsePostmanFile(collection, "gql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.collections) != 1 {
+		t.Fatalf("collections = %d, want 1", len(res.collections))
+	}
+	cg := res.collections[0]
+	if cg.BodyType != "graphql" || cg.GqlQuery != "query { user }" {
+		t.Fatalf("graphql body = %+v", cg)
+	}
+	if !json.Valid([]byte(cg.GqlVars)) || !strings.Contains(cg.GqlVars, "3") {
+		t.Fatalf("gql vars = %q", cg.GqlVars)
+	}
+
+	env := []byte(`{"name": "测试", "values": [
+	  {"key": "host", "value": "a.example", "enabled": true},
+	  {"key": "secret", "value": "x", "enabled": false}
+	]}`)
+	res, err = parsePostmanFile(env, "测试")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.envSets) != 1 || res.envSets[0].Name != "测试" {
+		t.Fatalf("envSets = %+v", res.envSets)
+	}
+	vars := res.envSets[0].Vars
+	if len(vars) != 2 || vars[0].Disabled || !vars[1].Disabled {
+		t.Fatalf("vars = %+v, want secret disabled", vars)
+	}
+
+	exported := []pmEnvValue{
+		{Key: "token", Value: "T-42", Type: "default", Enabled: true},
+		{Key: "off", Value: "v", Type: "default", Enabled: false},
+	}
+	b, err := json.Marshal(struct {
+		Name   string       `json:"name"`
+		Values []pmEnvValue `json:"values"`
+	}{Name: "回环", Values: exported})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = parsePostmanFile(b, "回环")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.envSets) != 1 || len(res.envSets[0].Vars) != 2 {
+		t.Fatalf("round-trip envSets = %+v", res.envSets)
+	}
+	rt := res.envSets[0].Vars
+	if rt[0].Key != "token" || rt[0].Value != "T-42" || rt[0].Disabled || !rt[1].Disabled {
+		t.Fatalf("round-trip vars = %+v, want off disabled", rt)
+	}
+}
+
+// TestSaveVarSingleSend: a single send with a 存变量 assertion writes the
+// extracted value into the active environment — not just the runner path.
+func TestSaveVarSingleSend(t *testing.T) {
+	m := newModel()
+	freshTabs(m)
+	m.t().assertions = []assertion{{Kind: "json", Target: "data.token", Save: true}}
+	m.applyResult(0, httpResult{Status: 200, Body: `{"data":{"token":"T-42"}}`}, nil)
+	var got string
+	for _, v := range m.envSets[m.activeEnvIndex()].Vars {
+		if v.Key == "token" {
+			got = v.Value
+		}
+	}
+	if got != "T-42" {
+		t.Fatalf("env token = %q, want T-42", got)
+	}
+	// the next outgoing carries it: {{token}} resolves
+	o := m.buildOutgoing()
+	o.URL = "http://x/query/{{token}}"
+	envs := o.Envs
+	if v := envValue(envs, "token"); v != "T-42" {
+		t.Fatalf("outgoing envs token = %q", v)
+	}
+	if s := substituteVars(o.URL, envs); s != "http://x/query/T-42" {
+		t.Fatalf("substituted = %q", s)
+	}
+}
+
 func TestPostmanAuth(t *testing.T) {
 	collection := []byte(`{
 	  "info": {"name": "带鉴权"},

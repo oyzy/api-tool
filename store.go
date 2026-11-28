@@ -28,17 +28,20 @@ type authConfig struct {
 // savedRequest is one saved collection item or one history entry. Group names
 // the folder it sits in; empty is the implicit 未分组.
 type savedRequest struct {
-	ID     int64 // unique id for in-place updates (e.g. the status lands after the entry is created)
-	Name   string
-	Group  string
-	Time   string
-	Status int // the response's HTTP status; 0 while the request is in flight
-	Method string
-	URL    string
+	ID         int64 // unique id for in-place updates (e.g. the status lands after the entry is created)
+	Name       string
+	Group      string
+	Time       string
+	Status     int   // the response's HTTP status; 0 while the request is in flight
+	Ms         int64 // how long the request took, in milliseconds; 0 while in flight
+	Method     string
+	URL        string
 	Params     []kv
 	Headers    []kv
 	BodyType   string
 	Body       string
+	GqlQuery   string // the GraphQL editor's query (bodyType graphql)
+	GqlVars    string // the GraphQL editor's variables, as JSON text
 	FormFields []formField
 	Auth       authConfig
 	Assertions []assertion
@@ -55,6 +58,8 @@ type savedTab struct {
 	Headers    []kv
 	BodyType   string
 	Body       string
+	GqlQuery   string
+	GqlVars    string
 	FormFields []formField
 	Auth       authConfig
 	Assertions []assertion
@@ -71,6 +76,8 @@ func (t *tabState) snapshot() savedTab {
 		Headers:    append([]kv(nil), t.headers...),
 		BodyType:   t.bodyType,
 		Body:       t.body,
+		GqlQuery:   t.gqlQuery,
+		GqlVars:    t.gqlVars,
 		FormFields: append([]formField(nil), t.formFields...),
 		Auth:       t.auth,
 		Assertions: append([]assertion(nil), t.assertions...),
@@ -89,6 +96,8 @@ func (t *tabState) restore(s savedTab) {
 		Headers:    s.Headers,
 		BodyType:   s.BodyType,
 		Body:       s.Body,
+		GqlQuery:   s.GqlQuery,
+		GqlVars:    s.GqlVars,
 		FormFields: s.FormFields,
 		Auth:       s.Auth,
 		Assertions: s.Assertions,
@@ -109,8 +118,8 @@ type storeData struct {
 	Envs        []kv           `json:"envs"`   // legacy single set
 	EnvSets     []envSet       `json:"envSets"`
 	ActiveEnv   string         `json:"activeEnv"`
-	Tabs        []savedTab     `json:"tabs"`      // the open request tabs
-	ActiveTab   int            `json:"activeTab"` // which one was on screen
+	Tabs        []savedTab     `json:"tabs"`       // the open request tabs
+	ActiveTab   int            `json:"activeTab"`  // which one was on screen
 	Theme       int            `json:"theme"`      // the theme preset's index
 	TimeoutSec  int            `json:"timeoutSec"` // request timeout in seconds; 0 = 30
 }
@@ -246,6 +255,8 @@ func (t *tabState) toSaved(name string) savedRequest {
 		Headers:    append([]kv(nil), t.headers...),
 		BodyType:   t.bodyType,
 		Body:       t.body,
+		GqlQuery:   t.gqlQuery,
+		GqlVars:    t.gqlVars,
 		FormFields: append([]formField(nil), t.formFields...),
 		Auth:       t.auth,
 		Assertions: append([]assertion(nil), t.assertions...),
@@ -260,6 +271,8 @@ func (t *tabState) applySaved(s savedRequest) {
 	t.headers = append([]kv(nil), s.Headers...)
 	t.bodyType = s.BodyType
 	t.body = s.Body
+	t.gqlQuery = s.GqlQuery
+	t.gqlVars = s.GqlVars
 	t.formFields = append([]formField(nil), s.FormFields...)
 	t.auth = s.Auth
 	t.assertions = append([]assertion(nil), s.Assertions...)

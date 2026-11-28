@@ -47,7 +47,7 @@ func (a *pmAuth) valueOf(key string) string {
 
 type pmItem struct {
 	Name    string     `json:"name"`
-	Item    []pmItem   `json:"item"`   // a folder's children
+	Item    []pmItem   `json:"item"`    // a folder's children
 	Request *pmRequest `json:"request"` // nil for folders
 }
 
@@ -68,6 +68,10 @@ type pmBody struct {
 			Language string `json:"language"`
 		} `json:"raw"`
 	} `json:"options"`
+	GraphQL *struct {
+		Query     string          `json:"query"`
+		Variables json.RawMessage `json:"variables"`
+	} `json:"graphql"`
 	Formdata   []pmKV `json:"formdata"`
 	Urlencoded []pmKV `json:"urlencoded"`
 }
@@ -77,6 +81,16 @@ type pmKV struct {
 	Value    string `json:"value"`
 	Type     string `json:"type"`
 	Disabled bool   `json:"disabled"`
+	Enabled  *bool  `json:"enabled"` // environment exports carry enabled, headers carry disabled
+}
+
+// pmEnvValue is one value of a Postman environment export: the shape our
+// environment export writes and the import reads back.
+type pmEnvValue struct {
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	Type    string `json:"type,omitempty"`
+	Enabled bool   `json:"enabled"`
 }
 
 // pmResult is one parsed export: everything the store needs to absorb it.
@@ -187,6 +201,14 @@ func walkPMItemsAuth(items []pmItem, group string, inherited *pmAuth, res *pmRes
 					}
 					s.Body += f.Key + ": " + f.Value + "\n"
 				}
+			case "graphql":
+				if b.GraphQL != nil && b.GraphQL.Query != "" {
+					s.BodyType = "graphql"
+					s.GqlQuery = b.GraphQL.Query
+					if len(b.GraphQL.Variables) > 0 {
+						s.GqlVars = string(b.GraphQL.Variables)
+					}
+				}
 			}
 		}
 		res.collections = append(res.collections, s)
@@ -251,14 +273,19 @@ func pmURLParts(raw json.RawMessage) (string, []kv) {
 }
 
 // pmVarsToKV maps Postman variables/environments into our kv rows, keeping
-// the disabled flag.
+// the disabled flag. Environment exports say enabled (absent = on), headers
+// say disabled, so both spellings land correctly.
 func pmVarsToKV(vars []pmKV) []kv {
 	var out []kv
 	for _, v := range vars {
 		if v.Key == "" {
 			continue
 		}
-		out = append(out, kv{Key: v.Key, Value: v.Value, Disabled: v.Disabled})
+		disabled := v.Disabled
+		if v.Enabled != nil {
+			disabled = !*v.Enabled
+		}
+		out = append(out, kv{Key: v.Key, Value: v.Value, Disabled: disabled})
 	}
 	return out
 }
